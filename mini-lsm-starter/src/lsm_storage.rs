@@ -31,9 +31,11 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
+use crate::iterators::merge_iterator::MergeIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{MemTable, MemTableIterator};
 use crate::mvcc::LsmMvccInner;
 use crate::table::SsTable;
 
@@ -309,7 +311,6 @@ impl LsmStorageInner {
             }
             None => {
                 for imm_memtable in &self.state.read().imm_memtables {
-                    println!("checking imm memtable");
                     if let Some(v) = imm_memtable.get(key) {
                         if v == Bytes::new() {
                             return Ok(None);
@@ -394,9 +395,23 @@ impl LsmStorageInner {
     /// Create an iterator over a range of keys.
     pub fn scan(
         &self,
-        _lower: Bound<&[u8]>,
-        _upper: Bound<&[u8]>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        unimplemented!()
+        let lock = self.state.read();
+        let mut children: Vec<Box<MemTableIterator>> = Vec::new();
+
+        // 最新 memtable 放前面
+        children.push(Box::new(lock.memtable.scan(lower.clone(), upper.clone())));
+
+        children.extend(
+            lock.imm_memtables
+                .iter()
+                .map(|m| Box::new(m.scan(lower.clone(), upper.clone()))),
+        );
+
+        let iter = LsmIterator::new(MergeIterator::create(children))?;
+
+        Ok(FusedIterator::new(iter))
     }
 }
