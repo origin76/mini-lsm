@@ -195,34 +195,31 @@ impl StorageIterator for MemTableIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        loop {
-            let mut next_item: Option<(Bytes, Bytes)> = None;
+        let mut next_item: Option<(Bytes, Bytes)> = None;
 
-            self.with_iter_mut(|iter| {
-                if let Some(entry) = iter.next() {
-                    next_item = Some((entry.key().clone(), entry.value().clone()));
-                } else {
-                    next_item = None;
-                }
-            });
+        self.with_iter_mut(|iter| {
+            if let Some(entry) = iter.next() {
+                next_item = Some((entry.key().clone(), entry.value().clone()));
+            } else {
+                next_item = None;
+            }
+        });
 
-            match next_item {
-                Some((k, v)) => {
-                    self.with_item_mut(|item| {
-                        item.0 = k;
-                        item.1 = v;
-                    });
-                    break;
-                }
-                None => {
-                    self.with_item_mut(|item| {
-                        item.0 = Bytes::new();
-                        item.1 = Bytes::new();
-                    });
-                    break;
-                }
+        match next_item {
+            Some((k, v)) => {
+                self.with_item_mut(|item| {
+                    item.0 = k;
+                    item.1 = v;
+                });
+            }
+            None => {
+                self.with_item_mut(|item| {
+                    item.0 = Bytes::new();
+                    item.1 = Bytes::new();
+                });
             }
         }
+
         self.with_item(|item| {
             println!("item.0 {:?} item.1 {:?}", item.0, item.1);
         });
