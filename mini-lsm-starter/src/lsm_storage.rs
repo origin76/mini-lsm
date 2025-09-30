@@ -304,9 +304,9 @@ impl LsmStorageInner {
         match self.state.read().memtable.get(key) {
             Some(v) => {
                 if v == Bytes::new() {
-                    return Ok(None);
+                    Ok(None)
                 } else {
-                    return Ok(Some(v));
+                    Ok(Some(v))
                 }
             }
             None => {
