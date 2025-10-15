@@ -17,7 +17,7 @@
 
 pub(crate) mod bloom;
 mod builder;
-mod iterator;
+pub(crate) mod iterator;
 
 use std::fs::File;
 use std::path::Path;
