@@ -17,7 +17,6 @@
 
 use anyhow::Result;
 
-
 use super::StorageIterator;
 
 /// Merges two iterators of different types into one. If the two iterators have the same key, only

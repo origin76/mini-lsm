@@ -33,11 +33,13 @@ use crate::compact::{
 };
 use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{MemTable, MemTableIterator};
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -301,6 +303,9 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let key_slice = KeySlice::from_slice(key);
+
+        // Check memtable first
         match self.state.read().memtable.get(key) {
             Some(v) => {
                 if v == Bytes::new() {
@@ -310,6 +315,7 @@ impl LsmStorageInner {
                 }
             }
             None => {
+                // Check immutable memtables
                 for imm_memtable in &self.state.read().imm_memtables {
                     if let Some(v) = imm_memtable.get(key) {
                         if v == Bytes::new() {
@@ -319,6 +325,31 @@ impl LsmStorageInner {
                         }
                     }
                 }
+
+                // Snapshot the state to check SSTables outside the lock
+                let snapshot = self.state.read().clone();
+                let l0_sstables = snapshot.l0_sstables.clone();
+                let sstables = snapshot.sstables.clone();
+                // Lock is now released
+
+                // Check SSTables (latest to oldest)
+                for sst_id in l0_sstables {
+                    if let Some(sst) = sstables.get(&sst_id) {
+                        // Check if key is in range based on first_key and last_key
+                        if key_slice >= sst.first_key().as_key_slice()
+                            && key_slice <= sst.last_key().as_key_slice()
+                        {
+                            if let Some((_k, v)) = sst.get(key_slice)? {
+                                if !v.is_empty() {
+                                    return Ok(Some(v));
+                                } else {
+                                    return Ok(None); // Tombstone
+                                }
+                            }
+                        }
+                    }
+                }
+
                 Ok(None)
             }
         }
@@ -398,20 +429,59 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
+        // 1) 先处理 memtable（在锁内构造，开销小）
         let lock = self.state.read();
-        let mut children: Vec<Box<MemTableIterator>> = Vec::new();
+        let mut mem_children: Vec<Box<MemTableIterator>> = Vec::new();
 
         // 最新 memtable 放前面
-        children.push(Box::new(lock.memtable.scan(lower.clone(), upper.clone())));
-
-        children.extend(
+        mem_children.push(Box::new(lock.memtable.scan(lower.clone(), upper.clone())));
+        mem_children.extend(
             lock.imm_memtables
                 .iter()
                 .map(|m| Box::new(m.scan(lower.clone(), upper.clone()))),
         );
+        let memtable_iter = MergeIterator::create(mem_children);
 
-        let iter = LsmIterator::new(MergeIterator::create(children))?;
+        // 2) 克隆 SST 信息，释放锁
+        let l0_sstables = lock.l0_sstables.clone();
+        let sstables = lock.sstables.clone();
+        drop(lock);
 
+        // 3) 在锁外为每个 L0 SST 创建迭代器，正确处理 Bound::Excluded
+        let mut sst_children: Vec<Box<SsTableIterator>> = Vec::new();
+
+        // 计算用于 seek 的下界 key（仅用于定位；Excluded 需要额外跳过）
+        let lower_key_bytes = match &lower {
+            Bound::Included(k) | Bound::Excluded(k) => *k,
+            Bound::Unbounded => &[][..],
+        };
+        let lower_key_slice = KeySlice::from_slice(lower_key_bytes);
+
+        for sst_id in l0_sstables {
+            if let Some(sst) = sstables.get(&sst_id) {
+                // 若需要，也可先过滤 key 范围：这里保持简单，直接创建并校验
+                let mut it = SsTableIterator::create_and_seek_to_key(sst.clone(), lower_key_slice)?;
+
+                // 若下界是排除且当前 key == 下界，则跳过
+                if let Bound::Excluded(excl) = &lower {
+                    let excl_slice = KeySlice::from_slice(excl);
+                    if it.is_valid() && it.key() == excl_slice {
+                        it.next()?;
+                    }
+                }
+
+                // 只有在仍然有效时才加入（否则该表没有 >= lower 的数据）
+                if it.is_valid() {
+                    sst_children.push(Box::new(it));
+                }
+            }
+        }
+
+        let sst_iter = MergeIterator::create(sst_children);
+
+        // 4) 合并 memtable 与 sstable，传入上界给 LsmIterator 控制
+        let two_merge_iter = TwoMergeIterator::create(memtable_iter, sst_iter)?;
+        let iter = LsmIterator::new(two_merge_iter, upper.map(|b| Bytes::copy_from_slice(b)))?;
         Ok(FusedIterator::new(iter))
     }
 }

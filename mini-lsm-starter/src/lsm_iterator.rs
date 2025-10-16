@@ -15,26 +15,35 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use std::ops::Bound;
+
 use anyhow::{Result, anyhow};
+use bytes::Bytes;
 
 use crate::{
-    iterators::{StorageIterator, merge_iterator::MergeIterator},
+    iterators::{
+        StorageIterator, merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator,
+    },
     mem_table::MemTableIterator,
+    table::iterator::SsTableIterator,
 };
 
 /// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
-type LsmIteratorInner = MergeIterator<MemTableIterator>;
+type LsmIteratorInner =
+    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
+    end_bound: Bound<Bytes>,
     is_valid: bool,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner) -> Result<Self> {
+    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
         let mut it = Self {
             is_valid: iter.is_valid(),
             inner: iter,
+            end_bound,
         };
         while it.inner.value().is_empty() {
             it.next()?;
@@ -47,7 +56,12 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        self.inner.is_valid()
+        self.is_valid
+            && match &self.end_bound {
+                Bound::Unbounded => true,
+                Bound::Included(key) => self.key() <= key.as_ref(),
+                Bound::Excluded(key) => self.key() < key.as_ref(),
+            }
     }
 
     fn key(&self) -> &[u8] {
@@ -63,10 +77,15 @@ impl StorageIterator for LsmIterator {
             self.inner.next()?; // 推进到底层
 
             if !self.inner.is_valid() {
+                self.is_valid = false;
                 return Ok(());
             }
 
-            println!("key {:?} value {:?}", self.key(), self.value());
+            // 检查是否超出 end_bound
+            if !self.is_valid() {
+                self.is_valid = false;
+                return Ok(());
+            }
 
             if !self.inner.value().is_empty() {
                 return Ok(());

@@ -25,11 +25,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 pub use builder::SsTableBuilder;
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 pub use iterator::SsTableIterator;
 
 use crate::block::Block;
-use crate::key::{Key, KeyBytes, KeySlice};
+use crate::key::{Key, KeyBytes, KeySlice, KeyVec};
 use crate::lsm_storage::BlockCache;
 
 use self::bloom::Bloom;
@@ -236,6 +236,10 @@ impl SsTable {
     /// Note: You may want to make use of the `first_key` stored in `BlockMeta`.
     /// You may also assume the key-value pairs stored in each consecutive block are sorted.
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
+        println!(
+            "find_block_idx: searching for key {:?} in SSTable {}",
+            key, self.id
+        );
         let meta = self
             .block_meta
             .binary_search_by(|m| m.first_key.as_key_slice().cmp(&key));
@@ -275,5 +279,36 @@ impl SsTable {
 
     pub fn max_ts(&self) -> u64 {
         self.max_ts
+    }
+
+    /// Get a key from the SSTable.
+    pub fn get(&self, key: KeySlice) -> Result<Option<(KeyVec, Bytes)>> {
+        // First check if key is within table range
+        if key < self.first_key().as_key_slice() || key > self.last_key().as_key_slice() {
+            return Ok(None);
+        }
+
+        // Find the block that may contain the key
+        let block_idx = self.find_block_idx(key);
+
+        if block_idx >= self.num_of_blocks() {
+            return Ok(None);
+        }
+
+        // Read the block
+        let block = self.read_block(block_idx)?;
+
+        // Search for the key in the block
+        let iterator = crate::block::BlockIterator::create_and_seek_to_key(block, key);
+
+        // Find the exact key
+        if iterator.is_valid() && iterator.key() == key {
+            return Ok(Some((
+                iterator.key().to_key_vec(),
+                Bytes::copy_from_slice(iterator.value()),
+            )));
+        }
+
+        Ok(None)
     }
 }
