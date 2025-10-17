@@ -23,7 +23,7 @@ use nom::AsBytes;
 
 use super::{BlockMeta, SsTable};
 use crate::{
-    block::{self, BlockBuilder},
+    block::BlockBuilder,
     key::{Key, KeySlice},
     lsm_storage::BlockCache,
     table::FileObject,

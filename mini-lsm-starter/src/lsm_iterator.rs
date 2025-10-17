@@ -45,14 +45,19 @@ impl LsmIterator {
             inner: iter,
             end_bound,
         };
-        while it.inner.value().is_empty() {
+
+        while it.is_valid && it.inner.value().is_empty() {
             it.next()?;
         }
+
         Ok(it)
     }
 }
 
 impl StorageIterator for LsmIterator {
+    fn num_active_iterators(&self) -> usize {
+        self.inner.num_active_iterators()
+    }
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
@@ -112,6 +117,13 @@ impl<I: StorageIterator> FusedIterator<I> {
 }
 
 impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
+    fn num_active_iterators(&self) -> usize {
+        if self.has_errored {
+            0
+        } else {
+            self.iter.num_active_iterators()
+        }
+    }
     type KeyType<'a>
         = I::KeyType<'a>
     where

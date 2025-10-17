@@ -98,6 +98,17 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
 {
     type KeyType<'a> = KeySlice<'a>;
 
+    fn num_active_iterators(&self) -> usize {
+        self.iters
+            .iter()
+            .map(|w| w.1.num_active_iterators())
+            .sum::<usize>()
+            + self
+                .current
+                .as_ref()
+                .map_or(0, |w| w.1.num_active_iterators())
+    }
+
     fn key(&self) -> KeySlice {
         self.current
             .as_ref()
@@ -118,21 +129,24 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
 
     fn next(&mut self) -> Result<()> {
         let current = self.current.as_mut().unwrap();
-        println!("current k {:?} v {:?}", current.1.key(), current.1.value());
-        // Pop the item out of the heap if they have the same value.
+
+        if !current.1.is_valid() {
+            return Ok(()); // 或者返回错误
+        }
+
+        // 保存当前 key（现在可以安全调用）
+        let current_key = current.1.key().to_key_vec();
+
+        // 推进 current
+        current.1.next()?;
+
+        // 处理堆中相同 key 的迭代器
         while let Some(mut inner_iter) = self.iters.peek_mut() {
-            debug_assert!(
-                inner_iter.1.key() >= current.1.key(),
-                "heap invariant violated"
-            );
-            if inner_iter.1.key() == current.1.key() {
-                // Case 1: an error occurred when calling `next`.
+            if inner_iter.1.key() == current_key.as_key_slice() {
                 if let e @ Err(_) = inner_iter.1.next() {
                     PeekMut::pop(inner_iter);
                     return e;
                 }
-
-                // Case 2: iter is no longer valid.
                 if !inner_iter.1.is_valid() {
                     PeekMut::pop(inner_iter);
                 }
@@ -141,9 +155,7 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
             }
         }
 
-        current.1.next()?;
-
-        // If the current iterator is invalid, pop it out of the heap and select the next one.
+        // 如果 current 无效，从堆中取下一个
         if !current.1.is_valid() {
             if let Some(iter) = self.iters.pop() {
                 *current = iter;
@@ -151,7 +163,7 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
             return Ok(());
         }
 
-        // Otherwise, compare with heap top and swap if necessary.
+        // 维护堆不变式
         if let Some(mut inner_iter) = self.iters.peek_mut() {
             if *current < *inner_iter {
                 std::mem::swap(&mut *inner_iter, current);

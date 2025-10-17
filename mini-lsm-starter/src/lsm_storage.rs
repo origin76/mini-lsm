@@ -22,11 +22,79 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use anyhow::{Ok, Result};
+use anyhow::{Ok, Result, anyhow};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::block::Block;
+
+// Helper function to check if two key ranges overlap
+// Returns true if range [lower1, upper1] overlaps with [lower2, upper2]
+pub fn ranges_overlap_relaxed(
+    lower1: Bound<&[u8]>,
+    upper1: Bound<&[u8]>,
+    lower2: Bound<&[u8]>,
+    upper2: Bound<&[u8]>,
+) -> bool {
+    fn bound_to_inclusive_key<'a>(b: &'a Bound<&'a [u8]>) -> Option<&'a [u8]> {
+        match b {
+            Bound::Included(k) | Bound::Excluded(k) => Some(k),
+            Bound::Unbounded => None,
+        }
+    }
+
+    let l1 = bound_to_inclusive_key(&lower1);
+    let u1 = bound_to_inclusive_key(&upper1);
+    let l2 = bound_to_inclusive_key(&lower2);
+    let u2 = bound_to_inclusive_key(&upper2);
+
+    // 如果有 unbounded，直接认为重叠
+    if lower1 == Bound::Unbounded
+        || upper1 == Bound::Unbounded
+        || lower2 == Bound::Unbounded
+        || upper2 == Bound::Unbounded
+    {
+        return true;
+    }
+
+    // 允许贴边 overlap: 即 upper1 >= lower2 && upper2 >= lower1
+    if let (Some(u1), Some(l2)) = (u1, l2) {
+        if u1 < l2 {
+            return false;
+        }
+    }
+    if let (Some(u2), Some(l1)) = (u2, l1) {
+        if u2 < l1 {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn table_out_of_range(
+    lower: &Bound<&[u8]>,
+    upper: &Bound<&[u8]>,
+    table_lower: &[u8],
+    table_upper: &[u8],
+) -> bool {
+    let before_range = match upper {
+        Bound::Included(k) => *k < table_lower,
+        Bound::Excluded(k) => *k <= table_lower,
+        Bound::Unbounded => false,
+    };
+
+    if before_range {
+        return true;
+    }
+
+    match lower {
+        Bound::Included(k) => *k > table_upper,
+        Bound::Excluded(k) => *k >= table_upper,
+        Bound::Unbounded => false,
+    }
+}
+
 use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
@@ -39,7 +107,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{MemTable, MemTableIterator};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -174,7 +242,22 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        self.compaction_notifier.send(()).ok();
+        self.flush_notifier.send(()).ok();
+
+        if let Some(handle) = self.flush_thread.lock().take() {
+            handle
+                .join()
+                .map_err(|e| anyhow!("flush thread panicked: {:?}", e))?;
+        }
+
+        if let Some(handle) = self.compaction_thread.lock().take() {
+            handle
+                .join()
+                .map_err(|e| anyhow!("compaction thread panicked: {:?}", e))?;
+        }
+
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -415,7 +498,48 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        // 1. 进入临界区，抓取 `_state_lock` 以及读锁 state，提取必要信息
+        let (memtable_to_flush, curr_state_snapshot, sst_id);
+        {
+            let _state_lock = self.state_lock.lock();
+            let state_guard = self.state.read();
+
+            memtable_to_flush = state_guard
+                .imm_memtables
+                .last()
+                .cloned()
+                .expect("No immutable memtable to flush");
+            curr_state_snapshot = state_guard.clone();
+            sst_id = self.next_sst_id();
+
+            // state_guard 在此块末尾 drop
+            // _state_lock 也在此块末尾 drop
+        }
+
+        // 2. 锁外进行耗时操作
+        let mut builder = SsTableBuilder::new(self.options.block_size);
+        memtable_to_flush.flush(&mut builder)?;
+        let path = self.path_of_sst(sst_id);
+        let sstable = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
+
+        // 3. 构造新状态并写回
+        let mut imm_memtables = curr_state_snapshot.imm_memtables.clone();
+        imm_memtables.pop();
+        let mut l0_sstables = curr_state_snapshot.l0_sstables.clone();
+        l0_sstables.insert(0, sst_id);
+        let mut sstables = curr_state_snapshot.sstables.clone();
+        sstables.insert(sst_id, Arc::new(sstable));
+
+        let new_state = Arc::new(LsmStorageState {
+            memtable: curr_state_snapshot.memtable.clone(),
+            imm_memtables,
+            l0_sstables,
+            levels: curr_state_snapshot.levels.clone(),
+            sstables,
+        });
+
+        *(self.state.write()) = new_state;
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
@@ -429,11 +553,10 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        // 1) 先处理 memtable（在锁内构造，开销小）
+        // ---- Step 1: Memtables ----
         let lock = self.state.read();
         let mut mem_children: Vec<Box<MemTableIterator>> = Vec::new();
 
-        // 最新 memtable 放前面
         mem_children.push(Box::new(lock.memtable.scan(lower.clone(), upper.clone())));
         mem_children.extend(
             lock.imm_memtables
@@ -442,44 +565,52 @@ impl LsmStorageInner {
         );
         let memtable_iter = MergeIterator::create(mem_children);
 
-        // 2) 克隆 SST 信息，释放锁
+        // ---- Step 2: Clone SST Info ----
         let l0_sstables = lock.l0_sstables.clone();
         let sstables = lock.sstables.clone();
         drop(lock);
 
-        // 3) 在锁外为每个 L0 SST 创建迭代器，正确处理 Bound::Excluded
+        // ---- Step 3: SST Iterators ----
         let mut sst_children: Vec<Box<SsTableIterator>> = Vec::new();
-
-        // 计算用于 seek 的下界 key（仅用于定位；Excluded 需要额外跳过）
-        let lower_key_bytes = match &lower {
-            Bound::Included(k) | Bound::Excluded(k) => *k,
-            Bound::Unbounded => &[][..],
+        let lower_key_slice = match &lower {
+            Bound::Included(k) | Bound::Excluded(k) => KeySlice::from_slice(k),
+            Bound::Unbounded => KeySlice::from_slice(b""),
         };
-        let lower_key_slice = KeySlice::from_slice(lower_key_bytes);
 
         for sst_id in l0_sstables {
             if let Some(sst) = sstables.get(&sst_id) {
-                // 若需要，也可先过滤 key 范围：这里保持简单，直接创建并校验
+                let table_lower = sst.first_key().raw_ref();
+                let table_upper = sst.last_key().raw_ref();
+
+                if table_out_of_range(&lower, &upper, table_lower, table_upper) {
+                    continue;
+                }
+
+                if !ranges_overlap_relaxed(
+                    lower.clone(),
+                    upper.clone(),
+                    Bound::Included(table_lower),
+                    Bound::Included(table_upper),
+                ) {
+                    continue;
+                }
+
                 let mut it = SsTableIterator::create_and_seek_to_key(sst.clone(), lower_key_slice)?;
 
-                // 若下界是排除且当前 key == 下界，则跳过
                 if let Bound::Excluded(excl) = &lower {
-                    let excl_slice = KeySlice::from_slice(excl);
-                    if it.is_valid() && it.key() == excl_slice {
+                    if it.is_valid() && it.key() == KeySlice::from_slice(excl) {
                         it.next()?;
                     }
                 }
 
-                // 只有在仍然有效时才加入（否则该表没有 >= lower 的数据）
                 if it.is_valid() {
                     sst_children.push(Box::new(it));
                 }
             }
         }
 
+        // ---- Step 4: Merge and return ----
         let sst_iter = MergeIterator::create(sst_children);
-
-        // 4) 合并 memtable 与 sstable，传入上界给 LsmIterator 控制
         let two_merge_iter = TwoMergeIterator::create(memtable_iter, sst_iter)?;
         let iter = LsmIterator::new(two_merge_iter, upper.map(|b| Bytes::copy_from_slice(b)))?;
         Ok(FusedIterator::new(iter))

@@ -161,7 +161,17 @@ impl LsmStorageInner {
     }
 
     fn trigger_flush(&self) -> Result<()> {
-        Ok(())
+        let should_flush = {
+            let state = self.state.read();
+            let total_memtables = 1 + state.imm_memtables.len();
+            total_memtables > self.options.num_memtable_limit && !state.imm_memtables.is_empty()
+        };
+
+        if should_flush {
+            self.force_flush_next_imm_memtable()
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn spawn_flush_thread(
