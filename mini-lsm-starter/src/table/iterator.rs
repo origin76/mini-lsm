@@ -76,7 +76,7 @@ impl SsTableIterator {
         } else {
             // 在当前块中查找
             self.blk_iter.seek_to_key(key);
-            if (self.blk_iter.is_valid()) {
+            if self.blk_iter.is_valid() {
                 return Ok(());
             } else {
                 // 如果在当前块中没有找到，尝试移动到下一个块
@@ -98,7 +98,7 @@ impl StorageIterator for SsTableIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     /// Return the `key` that's held by the underlying block iterator.
-    fn key(&self) -> KeySlice {
+    fn key(&'_ self) -> KeySlice<'_> {
         self.blk_iter.key()
     }
 

@@ -84,7 +84,7 @@ impl<I: StorageIterator> MergeIterator<I> {
             }
         }
 
-        let mut current = heap.pop().unwrap();
+        let current = heap.pop().unwrap();
 
         Self {
             iters: heap,
@@ -109,7 +109,7 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
                 .map_or(0, |w| w.1.num_active_iterators())
     }
 
-    fn key(&self) -> KeySlice {
+    fn key(&self) -> KeySlice<'_> {
         self.current
             .as_ref()
             .map(|w| w.1.key())

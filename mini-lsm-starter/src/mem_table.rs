@@ -192,7 +192,7 @@ impl StorageIterator for MemTableIterator {
         self.with_item(|item| item.1.as_ref())
     }
 
-    fn key(&self) -> KeySlice {
+    fn key(&self) -> KeySlice<'_> {
         self.with_item(|item| KeySlice::from_slice(item.0.as_ref()))
     }
 

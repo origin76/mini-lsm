@@ -16,8 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::collections::HashMap;
-use std::f32::consts::E;
-use std::ops::{Bound, DerefMut};
+use std::ops::{Bound};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -27,50 +26,6 @@ use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::block::Block;
-
-// Helper function to check if two key ranges overlap
-// Returns true if range [lower1, upper1] overlaps with [lower2, upper2]
-pub fn ranges_overlap_relaxed(
-    lower1: Bound<&[u8]>,
-    upper1: Bound<&[u8]>,
-    lower2: Bound<&[u8]>,
-    upper2: Bound<&[u8]>,
-) -> bool {
-    fn bound_to_inclusive_key<'a>(b: &'a Bound<&'a [u8]>) -> Option<&'a [u8]> {
-        match b {
-            Bound::Included(k) | Bound::Excluded(k) => Some(k),
-            Bound::Unbounded => None,
-        }
-    }
-
-    let l1 = bound_to_inclusive_key(&lower1);
-    let u1 = bound_to_inclusive_key(&upper1);
-    let l2 = bound_to_inclusive_key(&lower2);
-    let u2 = bound_to_inclusive_key(&upper2);
-
-    // 如果有 unbounded，直接认为重叠
-    if lower1 == Bound::Unbounded
-        || upper1 == Bound::Unbounded
-        || lower2 == Bound::Unbounded
-        || upper2 == Bound::Unbounded
-    {
-        return true;
-    }
-
-    // 允许贴边 overlap: 即 upper1 >= lower2 && upper2 >= lower1
-    if let (Some(u1), Some(l2)) = (u1, l2) {
-        if u1 < l2 {
-            return false;
-        }
-    }
-    if let (Some(u2), Some(l1)) = (u2, l1) {
-        if u2 < l1 {
-            return false;
-        }
-    }
-
-    true
-}
 
 fn table_out_of_range(
     lower: &Bound<&[u8]>,
@@ -583,15 +538,6 @@ impl LsmStorageInner {
                 let table_upper = sst.last_key().raw_ref();
 
                 if table_out_of_range(&lower, &upper, table_lower, table_upper) {
-                    continue;
-                }
-
-                if !ranges_overlap_relaxed(
-                    lower.clone(),
-                    upper.clone(),
-                    Bound::Included(table_lower),
-                    Bound::Included(table_upper),
-                ) {
                     continue;
                 }
 
