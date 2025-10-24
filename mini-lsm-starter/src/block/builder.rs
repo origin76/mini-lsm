@@ -72,10 +72,8 @@ impl BlockBuilder {
 
         let entry_size = 2 + 2 + rest_len + 2 + value.len() as u16; // overlap_u16 + rest_u16 + rest_key + value_u16 + value
 
-        if offset + entry_size > self.block_size as u16 {
-            if !self.first_key.is_empty() {
-                return false;
-            }
+        if offset + entry_size > self.block_size as u16 && !self.first_key.is_empty() {
+            return false;
         }
 
         if self.first_key.is_empty() {
@@ -86,7 +84,7 @@ impl BlockBuilder {
         self.offsets.push(offset);
 
         self.data.put_u16_le(overlap_len);
-        self.data.put_u16_le(rest_len as u16);
+        self.data.put_u16_le(rest_len);
         self.data.put_slice(&key.raw_ref()[overlap_len as usize..]);
         self.data.put_u16_le(value.len() as u16);
         self.data.put_slice(value);

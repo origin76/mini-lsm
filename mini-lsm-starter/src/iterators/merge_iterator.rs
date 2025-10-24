@@ -124,7 +124,7 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     }
 
     fn is_valid(&self) -> bool {
-        self.current.as_ref().map_or(false, |w| w.1.is_valid())
+        self.current.as_ref().is_some_and(|w| w.1.is_valid())
     }
 
     fn next(&mut self) -> Result<()> {
@@ -164,10 +164,10 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
         }
 
         // 维护堆不变式
-        if let Some(mut inner_iter) = self.iters.peek_mut() {
-            if *current < *inner_iter {
-                std::mem::swap(&mut *inner_iter, current);
-            }
+        if let Some(mut inner_iter) = self.iters.peek_mut()
+            && *current < *inner_iter
+        {
+            std::mem::swap(&mut *inner_iter, current);
         }
 
         Ok(())

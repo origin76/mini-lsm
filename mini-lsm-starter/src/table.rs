@@ -58,10 +58,10 @@ impl BlockMeta {
             buf.extend_from_slice(&meta.offset.to_le_bytes());
 
             buf.extend_from_slice(&(meta.first_key.len() as u16).to_le_bytes());
-            buf.extend_from_slice(&meta.first_key.raw_ref());
+            buf.extend_from_slice(meta.first_key.raw_ref());
 
             buf.extend_from_slice(&(meta.last_key.len() as u16).to_le_bytes());
-            buf.extend_from_slice(&meta.last_key.raw_ref());
+            buf.extend_from_slice(meta.last_key.raw_ref());
         }
     }
 
@@ -163,8 +163,8 @@ impl SsTable {
         let bloom_len = file.size() - 4 - bloom_offset;
         let bloom = SsTable::read_bloom(&file, bloom_offset, bloom_len)?;
 
-        let meta_offset_offset = bloom_offset as u64 - 4;
-        let meta_offset_bytes = file.read(meta_offset_offset as u64, 4)?;
+        let meta_offset_offset = bloom_offset - 4;
+        let meta_offset_bytes = file.read(meta_offset_offset, 4)?;
         let block_meta_offset = u32::from_le_bytes(meta_offset_bytes.try_into().unwrap()) as u64;
         let block_meta_len = bloom_offset - 4 - block_meta_offset;
 
@@ -172,7 +172,7 @@ impl SsTable {
 
         // 计算SSTable的第一个和最后一个键
         let first_key = block_meta
-            .get(0)
+            .first()
             .map_or(KeyBytes::default(), |meta| meta.first_key.clone());
         let last_key = block_meta
             .last()
@@ -242,7 +242,13 @@ impl SsTable {
 
     /// Read a block from disk, with block cache. (Day 4)
     pub fn read_block_cached(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        if let Some(cache) = &self.block_cache {
+            cache
+                .try_get_with((self.id, block_idx), || self.read_block(block_idx))
+                .map_err(|e| anyhow::anyhow!(e))
+        } else {
+            self.read_block(block_idx)
+        }
     }
 
     /// Find the block that may contain `key`.
@@ -309,7 +315,7 @@ impl SsTable {
         }
 
         // Read the block
-        let block = self.read_block(block_idx)?;
+        let block = self.read_block_cached(block_idx)?;
 
         // Search for the key in the block
         let iterator = crate::block::BlockIterator::create_and_seek_to_key(block, key);

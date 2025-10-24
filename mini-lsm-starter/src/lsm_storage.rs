@@ -372,23 +372,20 @@ impl LsmStorageInner {
 
                 // Check SSTables (latest to oldest)
                 for sst_id in l0_sstables {
-                    if let Some(sst) = sstables.get(&sst_id) {
-                        // Check if key is in range based on first_key and last_key
-                        if key_slice >= sst.first_key().as_key_slice()
-                            && key_slice <= sst.last_key().as_key_slice()
-                            && sst
-                                .bloom
-                                .as_ref()
-                                .unwrap()
-                                .may_contain(farmhash::fingerprint32(key))
-                        {
-                            if let Some((_k, v)) = sst.get(key_slice)? {
-                                if !v.is_empty() {
-                                    return Ok(Some(v));
-                                } else {
-                                    return Ok(None); // Tombstone
-                                }
-                            }
+                    if let Some(sst) = sstables.get(&sst_id)
+                        && key_slice >= sst.first_key().as_key_slice()
+                        && key_slice <= sst.last_key().as_key_slice()
+                        && sst
+                            .bloom
+                            .as_ref()
+                            .unwrap()
+                            .may_contain(farmhash::fingerprint32(key))
+                        && let Some((_k, v)) = sst.get(key_slice)?
+                    {
+                        if !v.is_empty() {
+                            return Ok(Some(v));
+                        } else {
+                            return Ok(None); // Tombstone
                         }
                     }
                 }
@@ -517,11 +514,11 @@ impl LsmStorageInner {
         let lock = self.state.read();
         let mut mem_children: Vec<Box<MemTableIterator>> = Vec::new();
 
-        mem_children.push(Box::new(lock.memtable.scan(lower.clone(), upper.clone())));
+        mem_children.push(Box::new(lock.memtable.scan(lower, upper)));
         mem_children.extend(
             lock.imm_memtables
                 .iter()
-                .map(|m| Box::new(m.scan(lower.clone(), upper.clone()))),
+                .map(|m| Box::new(m.scan(lower, upper))),
         );
         let memtable_iter = MergeIterator::create(mem_children);
 
@@ -548,10 +545,11 @@ impl LsmStorageInner {
 
                 let mut it = SsTableIterator::create_and_seek_to_key(sst.clone(), lower_key_slice)?;
 
-                if let Bound::Excluded(excl) = &lower {
-                    if it.is_valid() && it.key() == KeySlice::from_slice(excl) {
-                        it.next()?;
-                    }
+                if let Bound::Excluded(excl) = &lower
+                    && it.is_valid()
+                    && it.key() == KeySlice::from_slice(excl)
+                {
+                    it.next()?;
                 }
 
                 if it.is_valid() {
@@ -563,7 +561,7 @@ impl LsmStorageInner {
         // ---- Step 4: Merge and return ----
         let sst_iter = MergeIterator::create(sst_children);
         let two_merge_iter = TwoMergeIterator::create(memtable_iter, sst_iter)?;
-        let iter = LsmIterator::new(two_merge_iter, upper.map(|b| Bytes::copy_from_slice(b)))?;
+        let iter = LsmIterator::new(two_merge_iter, upper.map(Bytes::copy_from_slice))?;
         Ok(FusedIterator::new(iter))
     }
 }

@@ -136,13 +136,11 @@ impl<
 
     fn next(&mut self) -> Result<()> {
         // Advance the current iterator
-        if self.a.is_valid() && self.b.is_valid() {
-            if self.a.key() == self.b.key() {
-                self.a.next()?;
-                self.b.next()?;
-                self.advance_to_valid()?;
-                return Ok(());
-            }
+        if self.a.is_valid() && self.b.is_valid() && self.a.key() == self.b.key() {
+            self.a.next()?;
+            self.b.next()?;
+            self.advance_to_valid()?;
+            return Ok(());
         }
 
         // If keys are not equal, advance the current iterator
