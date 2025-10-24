@@ -321,7 +321,6 @@ impl SsTable {
                 Bytes::copy_from_slice(iterator.value()),
             )));
         }
-
         Ok(None)
     }
 }

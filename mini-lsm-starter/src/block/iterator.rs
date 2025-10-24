@@ -120,12 +120,24 @@ impl BlockIterator {
         let start = self.block.offsets[idx] as usize;
         let data = &self.block.data[start..];
 
-        let key_len = u16::from_le_bytes([data[0], data[1]]) as usize;
-        let key_bytes = &data[2..2 + key_len];
-        self.key = KeyVec::from_vec(key_bytes.to_vec());
+        let overlap_len = u16::from_le_bytes([data[0], data[1]]) as usize;
+        let rest_len = u16::from_le_bytes([data[2], data[3]]) as usize;
+        let rest_key_start = 4;
+        let rest_key = &data[rest_key_start..rest_key_start + rest_len];
+
+        if idx == 0 {
+            // First key
+            self.key = KeyVec::from_vec(rest_key.to_vec());
+            self.first_key = self.key.clone();
+        } else {
+            // Reconstruct key: first_key[..overlap_len] + rest_key
+            let mut full_key = self.first_key.as_key_slice().raw_ref()[..overlap_len].to_vec();
+            full_key.extend_from_slice(rest_key);
+            self.key = KeyVec::from_vec(full_key);
+        }
 
         // 解析 value
-        let value_offset = 2 + key_len;
+        let value_offset = rest_key_start + rest_len;
         let value_len = u16::from_le_bytes([data[value_offset], data[value_offset + 1]]) as usize;
         let value_start = value_offset + 2;
         let value_end = value_start + value_len;

@@ -54,10 +54,23 @@ impl BlockBuilder {
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
         let offset = self.data.len() as u16;
 
-        let key_len = key.len() as u16;
-        let value_len = value.len() as u16;
+        let overlap_len = if self.first_key.is_empty() {
+            0
+        } else {
+            let a = self.first_key.raw_ref();
+            let b = key.raw_ref();
+            let len = a.len().min(b.len());
+            (0..len).take_while(|&i| a[i] == b[i]).count() as u16
+        };
+        let rest_len = if overlap_len == 0 {
+            key.len() as u16
+        } else {
+            (key.len() - overlap_len as usize) as u16
+        };
+        let entry_size = overlap_len + rest_len + value.len() as u16 + 6; // overlap u16 + rest_len u16 + rest_key rest_len + value_len u16 + value + 6? Wait no
+        // Wait, entry_size is the bytes the data adds: but since rest_key is rest_len bytes, yes rest_len as u16 but in size + rest_len.
 
-        let entry_size = key_len + value_len + 6;
+        let entry_size = 2 + 2 + rest_len + 2 + value.len() as u16; // overlap_u16 + rest_u16 + rest_key + value_u16 + value
 
         if offset + entry_size > self.block_size as u16 {
             if !self.first_key.is_empty() {
@@ -65,16 +78,17 @@ impl BlockBuilder {
             }
         }
 
-        if self.offsets.is_empty() {
+        if self.first_key.is_empty() {
             self.first_key = key.to_key_vec();
         }
 
         // 写入 offsets
         self.offsets.push(offset);
 
-        self.data.put_u16_le(key_len);
-        self.data.put_slice(key.raw_ref());
-        self.data.put_u16_le(value_len);
+        self.data.put_u16_le(overlap_len);
+        self.data.put_u16_le(rest_len as u16);
+        self.data.put_slice(&key.raw_ref()[overlap_len as usize..]);
+        self.data.put_u16_le(value.len() as u16);
         self.data.put_slice(value);
 
         true
