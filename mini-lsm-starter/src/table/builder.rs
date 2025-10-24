@@ -26,7 +26,7 @@ use crate::{
     block::BlockBuilder,
     key::{Key, KeySlice},
     lsm_storage::BlockCache,
-    table::FileObject,
+    table::{FileObject, bloom::Bloom},
 };
 
 /// Builds an SSTable from key-value pairs.
@@ -37,6 +37,7 @@ pub struct SsTableBuilder {
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    key_hashes: Vec<u32>,
 }
 
 impl SsTableBuilder {
@@ -49,6 +50,7 @@ impl SsTableBuilder {
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
+            key_hashes: Vec::new(),
         }
     }
 
@@ -59,6 +61,7 @@ impl SsTableBuilder {
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
         // Try adding the key-value pair to the current block.
         let res = self.builder.add(key, value);
+        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
         // If the block is full (i.e., add returns false), finalize it and start a new block.
         if !res {
             // Instead of calling build() directly, we can handle the builder's state manually:
@@ -120,6 +123,15 @@ impl SsTableBuilder {
         let meta_offset = self.data.len() as u32;
         sstable_data.extend_from_slice(&meta_offset.to_le_bytes());
 
+        let bits_per_key = Bloom::bloom_bits_per_key(self.key_hashes.len(), 0.01);
+        let bloom = Bloom::build_from_key_hashes(&self.key_hashes, bits_per_key);
+        let bloom_offset = sstable_data.len() as u32;
+        let mut encode_bloom: Vec<u8> = Vec::new();
+        bloom.encode(&mut encode_bloom);
+
+        sstable_data.extend_from_slice(&encode_bloom);
+        sstable_data.extend_from_slice(&bloom_offset.to_le_bytes());
+
         let file = FileObject::create(path.as_ref(), sstable_data)?;
         Ok(SsTable {
             file,
@@ -129,7 +141,7 @@ impl SsTableBuilder {
             block_cache,
             first_key: Key::from_bytes(bytes::Bytes::from(self.first_key.clone().to_vec())),
             last_key: Key::from_bytes(bytes::Bytes::from(self.last_key.clone().to_vec())),
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
         })
     }

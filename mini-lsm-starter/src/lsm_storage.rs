@@ -376,6 +376,11 @@ impl LsmStorageInner {
                         // Check if key is in range based on first_key and last_key
                         if key_slice >= sst.first_key().as_key_slice()
                             && key_slice <= sst.last_key().as_key_slice()
+                            && sst
+                                .bloom
+                                .as_ref()
+                                .unwrap()
+                                .may_contain(farmhash::fingerprint32(key))
                         {
                             if let Some((_k, v)) = sst.get(key_slice)? {
                                 if !v.is_empty() {

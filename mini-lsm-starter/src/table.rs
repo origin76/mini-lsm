@@ -27,6 +27,7 @@ use anyhow::Result;
 pub use builder::SsTableBuilder;
 use bytes::{Buf, Bytes};
 pub use iterator::SsTableIterator;
+use nom::AsBytes;
 
 use crate::block::Block;
 use crate::key::{Key, KeyBytes, KeySlice, KeyVec};
@@ -156,10 +157,16 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        let meta_offset_offset = file.size() as u64 - 4;
+        let bloom_offset_offset = file.size() - 4;
+        let bloom_offset_bytes = file.read(bloom_offset_offset, 4)?;
+        let bloom_offset = u32::from_le_bytes(bloom_offset_bytes.try_into().unwrap()) as u64;
+        let bloom_len = file.size() - 4 - bloom_offset;
+        let bloom = SsTable::read_bloom(&file, bloom_offset, bloom_len)?;
+
+        let meta_offset_offset = bloom_offset as u64 - 4;
         let meta_offset_bytes = file.read(meta_offset_offset as u64, 4)?;
         let block_meta_offset = u32::from_le_bytes(meta_offset_bytes.try_into().unwrap()) as u64;
-        let block_meta_len = file.size() - 4 - block_meta_offset;
+        let block_meta_len = bloom_offset - 4 - block_meta_offset;
 
         let block_meta = SsTable::read_block_meta(&file, block_meta_offset, block_meta_len)?;
 
@@ -180,14 +187,20 @@ impl SsTable {
             block_cache,
             first_key,
             last_key,
-            bloom: None, // Bloom filter can be handled later
-            max_ts: 0,   // You can compute this during the iteration phase
+            bloom: Some(bloom), // Bloom filter can be handled later
+            max_ts: 0,          // You can compute this during the iteration phase
         })
     }
 
     fn read_block_meta(file: &FileObject, offset: u64, length: u64) -> Result<Vec<BlockMeta>> {
         let buf = file.read(offset, length)?;
         Ok(BlockMeta::decode_block_meta(bytes::Bytes::from(buf)))
+    }
+
+    fn read_bloom(file: &FileObject, offset: u64, length: u64) -> Result<Bloom> {
+        let buf = file.read(offset, length)?;
+        let res = Bloom::decode(buf.as_bytes())?;
+        Ok(res)
     }
 
     /// Create a mock SST with only first key + last key metadata
