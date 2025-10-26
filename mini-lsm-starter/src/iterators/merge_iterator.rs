@@ -60,6 +60,7 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
+        println!("merge create");
         if iters.is_empty() {
             return Self {
                 iters: BinaryHeap::new(),
