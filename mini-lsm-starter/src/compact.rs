@@ -182,20 +182,24 @@ impl LsmStorageInner {
             read_guard.clone()
         };
 
-        let l0_sstables = {
+        let mut l0_sstables = {
             let read_guard = self.state.read();
             read_guard.l0_sstables.clone()
         };
 
-        let l1_sstables = {
+        let mut l1_sstables = {
             let read_guard = self.state.read();
             read_guard.levels.first().unwrap().1.clone()
         };
 
         let task = CompactionTask::ForceFullCompaction {
-            l0_sstables,
-            l1_sstables,
+            l0_sstables: l0_sstables.clone(),
+            l1_sstables: l1_sstables.clone(),
         };
+
+        let mut old_ssts = Vec::new();
+        old_ssts.append(&mut l0_sstables);
+        old_ssts.append(&mut l1_sstables);
 
         let new_ssts = self.compact(&task)?;
         let new_sst_ids: Vec<_> = new_ssts.iter().map(|i| i.sst_id()).collect();
@@ -207,8 +211,12 @@ impl LsmStorageInner {
             let mut new_l0_sstables = state.l0_sstables.clone();
             new_l0_sstables.retain(|sst_id| !old_l0_sstables.contains(&sst_id));
             let mut new_sstables = state.sstables.clone();
+
             for i in new_ssts {
                 new_sstables.insert(i.sst_id(), i);
+            }
+            for &i in &old_ssts {
+                new_sstables.remove(&i);
             }
 
             let new_state = LsmStorageState {
@@ -219,6 +227,10 @@ impl LsmStorageInner {
                 sstables: new_sstables,
             };
             *state = Arc::new(new_state); // Atomic replacement of the state
+        }
+
+        for i in old_ssts {
+            std::fs::remove_file(self.path_of_sst(i))?;
         }
 
         Ok(())
