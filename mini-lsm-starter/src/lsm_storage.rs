@@ -55,6 +55,7 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::StorageIterator;
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::KeySlice;
@@ -367,11 +368,31 @@ impl LsmStorageInner {
                 // Snapshot the state to check SSTables outside the lock
                 let snapshot = self.state.read().clone();
                 let l0_sstables = snapshot.l0_sstables.clone();
+                let l1_sstables = snapshot.levels[0].1.clone();
                 let sstables = snapshot.sstables.clone();
                 // Lock is now released
 
                 // Check SSTables (latest to oldest)
                 for sst_id in l0_sstables {
+                    if let Some(sst) = sstables.get(&sst_id)
+                        && key_slice >= sst.first_key().as_key_slice()
+                        && key_slice <= sst.last_key().as_key_slice()
+                        && sst
+                            .bloom
+                            .as_ref()
+                            .unwrap()
+                            .may_contain(farmhash::fingerprint32(key))
+                        && let Some((_k, v)) = sst.get(key_slice)?
+                    {
+                        if !v.is_empty() {
+                            return Ok(Some(v));
+                        } else {
+                            return Ok(None); // Tombstone
+                        }
+                    }
+                }
+
+                for sst_id in l1_sstables {
                     if let Some(sst) = sstables.get(&sst_id)
                         && key_slice >= sst.first_key().as_key_slice()
                         && key_slice <= sst.last_key().as_key_slice()
@@ -558,9 +579,42 @@ impl LsmStorageInner {
             }
         }
 
+        let l1_sst_id = self.state.read().levels[0].1.clone(); // 获取 l1 层的 SST ID 列表
+        let l1_sst_iter;
+
+        let sstables = self.state.read().sstables.clone(); // 获取所有 SST 文件的 HashMap
+
+        // 创建一个新的 Vec，用于存放按顺序提取的 SST 文件
+        let mut ordered_ssts = Vec::new();
+
+        // 按照 l1_sst_id 的顺序，提取 sstables 中对应的元素
+        for sst_id in l1_sst_id {
+            if let Some(sst) = sstables.get(&sst_id) {
+                ordered_ssts.push(sst.clone()); // 将对应的 SST 文件添加到新 Vec 中
+            }
+        }
+        match lower {
+            Bound::Unbounded => {
+                l1_sst_iter = SstConcatIterator::create_and_seek_to_first(ordered_ssts)?;
+            }
+            Bound::Excluded(low) => {
+                l1_sst_iter = SstConcatIterator::create_and_seek_to_key(
+                    ordered_ssts,
+                    KeySlice::from_slice(low),
+                )?;
+            }
+            Bound::Included(low) => {
+                l1_sst_iter = SstConcatIterator::create_and_seek_to_key(
+                    ordered_ssts,
+                    KeySlice::from_slice(low),
+                )?;
+            }
+        }
+
         // ---- Step 4: Merge and return ----
         let sst_iter = MergeIterator::create(sst_children);
-        let two_merge_iter = TwoMergeIterator::create(memtable_iter, sst_iter)?;
+        let l0_merge_iter = TwoMergeIterator::create(memtable_iter, sst_iter)?;
+        let two_merge_iter = TwoMergeIterator::create(l0_merge_iter, l1_sst_iter)?;
         let iter = LsmIterator::new(two_merge_iter, upper.map(Bytes::copy_from_slice))?;
         Ok(FusedIterator::new(iter))
     }

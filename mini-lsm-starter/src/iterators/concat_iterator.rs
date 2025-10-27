@@ -35,11 +35,95 @@ pub struct SstConcatIterator {
 
 impl SstConcatIterator {
     pub fn create_and_seek_to_first(sstables: Vec<Arc<SsTable>>) -> Result<Self> {
-        unimplemented!()
+        if sstables.is_empty() {
+            return Ok(Self {
+                current: None,
+                next_sst_idx: 0,
+                sstables: vec![],
+            });
+        }
+
+        let mut iter = SstConcatIterator {
+            current: None,
+            next_sst_idx: 0,
+            sstables,
+        };
+
+        iter.seek_to_first()?;
+
+        Ok(iter)
     }
 
     pub fn create_and_seek_to_key(sstables: Vec<Arc<SsTable>>, key: KeySlice) -> Result<Self> {
-        unimplemented!()
+        if sstables.is_empty() {
+            return Ok(Self {
+                current: None,
+                next_sst_idx: 0,
+                sstables: vec![],
+            });
+        }
+        let mut iter = SstConcatIterator {
+            current: None,
+            next_sst_idx: 0,
+            sstables,
+        };
+
+        iter.seek_to_key(key)?;
+
+        Ok(iter)
+    }
+
+    fn seek_to_first(&mut self) -> Result<()> {
+        self.next_sst_idx = 0;
+        self.current = Some(SsTableIterator::create_and_seek_to_first(
+            self.sstables[self.next_sst_idx].clone(),
+        )?);
+        Ok(())
+    }
+
+    fn seek_to_key(&mut self, key: KeySlice) -> Result<()> {
+        println!("concat to key {:?}", key.raw_ref());
+
+        // 情况 1: key 小于全局最小 key
+        if key < self.sstables[0].first_key().as_key_slice() {
+            let iter = SsTableIterator::create_and_seek_to_first(self.sstables[0].clone())?;
+            self.current = Some(iter);
+            self.next_sst_idx = 0;
+            return Ok(());
+        }
+
+        // 情况 2: key 在范围中
+        for idx in 0..self.sstables.len() {
+            let sst = &self.sstables[idx];
+            if sst.first_key().as_key_slice() <= key && key <= sst.last_key().as_key_slice() {
+                let iter = SsTableIterator::create_and_seek_to_key(sst.clone(), key)?;
+                if iter.is_valid() {
+                    self.current = Some(iter);
+                    self.next_sst_idx = idx;
+                    return Ok(());
+                }
+            }
+        }
+
+        // 情况 3: key 大于全局最大 key → 设为 invalid
+        self.current = None;
+        self.next_sst_idx = self.sstables.len();
+        Ok(())
+    }
+
+    fn advance_to_next_sst(&mut self) -> Result<()> {
+        self.next_sst_idx += 1;
+
+        if self.next_sst_idx < self.sstables.len() {
+            self.current = Some(SsTableIterator::create_and_seek_to_first(
+                self.sstables[self.next_sst_idx].clone(),
+            )?);
+            self.current.as_mut().unwrap().seek_to_first()?;
+        } else {
+            self.current = None; // 所有 SST 文件迭代完毕
+        }
+
+        Ok(())
     }
 }
 
@@ -47,19 +131,29 @@ impl StorageIterator for SstConcatIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        self.current.as_ref().unwrap().key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.current.as_ref().unwrap().value()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        if let Some(iter) = self.current.as_ref() {
+            self.current.as_ref().unwrap().is_valid()
+        } else {
+            false
+        }
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if let Some(iter) = self.current.as_mut() {
+            iter.next()?;
+            if !iter.is_valid() {
+                self.advance_to_next_sst()?;
+            }
+        }
+        Ok(())
     }
 
     fn num_active_iterators(&self) -> usize {

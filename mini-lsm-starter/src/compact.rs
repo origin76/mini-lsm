@@ -209,7 +209,7 @@ impl LsmStorageInner {
             let mut state = self.state.write(); // Lock state for exclusive access
             let old_l0_sstables = curr_state.l0_sstables.clone();
             let mut new_l0_sstables = state.l0_sstables.clone();
-            new_l0_sstables.retain(|sst_id| !old_l0_sstables.contains(&sst_id));
+            new_l0_sstables.retain(|sst_id| !old_l0_sstables.contains(sst_id));
             let mut new_sstables = state.sstables.clone();
 
             for i in new_ssts {
