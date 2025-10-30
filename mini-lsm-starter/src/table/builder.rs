@@ -107,7 +107,6 @@ impl SsTableBuilder {
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
-        println!("Building SSTable with {} blocks", self.meta.len() + 1);
         if !self.builder.is_empty() {
             let block_data = self.builder.build().encode(); // Finalize the block data
             self.data.extend_from_slice(block_data.as_bytes());

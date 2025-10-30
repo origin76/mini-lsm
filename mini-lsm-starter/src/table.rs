@@ -255,23 +255,13 @@ impl SsTable {
     /// Note: You may want to make use of the `first_key` stored in `BlockMeta`.
     /// You may also assume the key-value pairs stored in each consecutive block are sorted.
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
-        println!(
-            "find_block_idx: searching for key {:?} in SSTable {}",
-            key, self.id
-        );
         let meta = self
             .block_meta
             .binary_search_by(|m| m.first_key.as_key_slice().cmp(&key));
         match meta {
             Ok(idx) => idx,
-            Err(0) => {
-                println!("find_block_idx: key is smaller than the first key in the table");
-                0
-            }
-            Err(idx) => {
-                println!("find_block_idx: key is not found, return the previous block");
-                idx - 1
-            }
+            Err(0) => 0,
+            Err(idx) => idx - 1,
         }
     }
 

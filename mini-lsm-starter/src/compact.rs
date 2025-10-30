@@ -147,11 +147,47 @@ impl LsmStorageInner {
                 let mut new_ssts = Vec::new();
                 let mut builder = SsTableBuilder::new(self.options.block_size);
                 while merge_iter.is_valid() {
-                    println!(
-                        "in compact key {:?} value {:?} ",
-                        merge_iter.key(),
-                        merge_iter.value()
-                    );
+                    if !merge_iter.value().is_empty() {
+                        builder.add(merge_iter.key(), merge_iter.value());
+                    }
+                    merge_iter.next()?;
+                    if builder.estimated_size() >= self.options.target_sst_size {
+                        let sst_id = self.next_sst_id();
+                        let path = self.path_of_sst(sst_id);
+                        let sst = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
+                        new_ssts.push(Arc::new(sst));
+                        builder = SsTableBuilder::new(self.options.block_size);
+                    }
+                }
+                if !builder.is_empty() {
+                    let sst_id = self.next_sst_id();
+                    let path = self.path_of_sst(sst_id);
+                    let sst = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
+                    new_ssts.push(Arc::new(sst));
+                }
+                Ok(new_ssts)
+            }
+            CompactionTask::Simple(task) => {
+                let snapshot = self.state.read().clone();
+                let sstables = &snapshot.sstables;
+                let all_ids = task
+                    .upper_level_sst_ids
+                    .iter()
+                    .chain(task.lower_level_sst_ids.iter())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut iterators: Vec<Box<SsTableIterator>> = Vec::new();
+                for &id in &all_ids {
+                    if let Some(sst) = sstables.get(&id) {
+                        let iter = SsTableIterator::create_and_seek_to_first(sst.clone())?;
+                        iterators.push(Box::new(iter));
+                    }
+                }
+                let mut merge_iter: MergeIterator<SsTableIterator> =
+                    MergeIterator::create(iterators);
+                let mut new_ssts = Vec::new();
+                let mut builder = SsTableBuilder::new(self.options.block_size);
+                while merge_iter.is_valid() {
                     if !merge_iter.value().is_empty() {
                         builder.add(merge_iter.key(), merge_iter.value());
                     }
@@ -237,7 +273,37 @@ impl LsmStorageInner {
     }
 
     fn trigger_compaction(&self) -> Result<()> {
-        unimplemented!()
+        let snapshot = self.state.read().clone();
+        let Some(task) = self
+            .compaction_controller
+            .generate_compaction_task(&snapshot)
+        else {
+            return Ok(());
+        };
+        let new_ssts = self.compact(&task)?;
+        let output_ids: Vec<_> = new_ssts.iter().map(|s| s.sst_id()).collect();
+        let mut state_guard = self.state.write(); // 获取写锁
+        let (mut new_state, to_remove) = self.compaction_controller.apply_compaction_result(
+            &snapshot,
+            &task,
+            &output_ids,
+            false,
+        );
+        for sst in new_ssts {
+            new_state.sstables.insert(sst.sst_id(), sst);
+        }
+        for &id in &to_remove {
+            new_state.sstables.remove(&id);
+        }
+        *state_guard = Arc::new(new_state);
+        std::mem::drop(state_guard);
+        for id in to_remove {
+            let res = std::fs::remove_file(self.path_of_sst(id));
+            if let Err(e) = res {
+                println!("remove fail {} {}", id, e);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn spawn_compaction_thread(

@@ -100,10 +100,8 @@ impl BlockIterator {
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
-        println!("block len{}", self.block.offsets.len());
         for i in 0..self.block.offsets.len() {
             self.decode_entry_at(i);
-            println!("self {:?} key {:?}", self.key.as_key_slice(), key);
             if self.key.as_key_slice() >= key {
                 self.idx = i;
                 return;

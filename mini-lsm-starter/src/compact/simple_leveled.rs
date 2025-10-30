@@ -47,9 +47,40 @@ impl SimpleLeveledCompactionController {
     /// Returns `None` if no compaction needs to be scheduled. The order of SSTs in the compaction task id vector matters.
     pub fn generate_compaction_task(
         &self,
-        _snapshot: &LsmStorageState,
+        snapshot: &LsmStorageState,
     ) -> Option<SimpleLeveledCompactionTask> {
-        unimplemented!()
+        // L0 trigger
+        if snapshot.l0_sstables.len() >= self.options.level0_file_num_compaction_trigger {
+            return Some(SimpleLeveledCompactionTask {
+                upper_level: None,
+                upper_level_sst_ids: snapshot.l0_sstables.clone(),
+                lower_level: 1,
+                lower_level_sst_ids: snapshot.levels[0].1.clone(),
+                is_lower_level_bottom_level: 1 == self.options.max_levels,
+            });
+        }
+        // Size ratio trigger
+        for level in 0..self.options.max_levels - 1 {
+            let upper_len = snapshot.levels[level].1.len();
+            let lower_len = snapshot.levels[level + 1].1.len();
+            if upper_len > 0 {
+                let ratio = if lower_len == 0 {
+                    0.0
+                } else {
+                    (lower_len as f64 / upper_len as f64) * 100.0
+                };
+                if ratio < self.options.size_ratio_percent as f64 {
+                    return Some(SimpleLeveledCompactionTask {
+                        upper_level: Some(level + 1),
+                        upper_level_sst_ids: snapshot.levels[level].1.clone(),
+                        lower_level: level + 2,
+                        lower_level_sst_ids: snapshot.levels[level + 1].1.clone(),
+                        is_lower_level_bottom_level: level + 2 == self.options.max_levels,
+                    });
+                }
+            }
+        }
+        None
     }
 
     /// Apply the compaction result.
@@ -61,10 +92,65 @@ impl SimpleLeveledCompactionController {
     /// in your implementation.
     pub fn apply_compaction_result(
         &self,
-        _snapshot: &LsmStorageState,
-        _task: &SimpleLeveledCompactionTask,
-        _output: &[usize],
+        snapshot: &LsmStorageState,
+        task: &SimpleLeveledCompactionTask,
+        output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
-        unimplemented!()
+        let to_remove = task
+            .upper_level_sst_ids
+            .iter()
+            .chain(task.lower_level_sst_ids.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        println!(
+            "to remove {:?} upper {} lower {}",
+            to_remove,
+            task.upper_level.unwrap_or(999),
+            task.lower_level
+        );
+        println!("upper sstid {:?}", task.upper_level_sst_ids);
+        println!("lower sstid {:?}", task.lower_level_sst_ids);
+        println!(" new output {:?}", output);
+
+        let mut levels = snapshot.levels.clone();
+
+        // Update L0 if applicable
+        let new_l0_sstables = if task.upper_level.is_none() {
+            snapshot
+                .l0_sstables
+                .iter()
+                .filter(|id| !task.upper_level_sst_ids.contains(id))
+                .cloned()
+                .collect()
+        } else {
+            snapshot.l0_sstables.clone()
+        };
+
+        // Update levels
+        for (idx, (_, level_ssts)) in levels.iter_mut().enumerate() {
+            let level = idx + 1; // levels[0] is L1
+            if Some(level) == task.upper_level {
+                println!("Before retain upper {}: {:?}", level, level_ssts);
+                level_ssts.retain(|id| !task.upper_level_sst_ids.contains(id));
+                println!("After retain upper {}: {:?}", level, level_ssts);
+            }
+            if level == task.lower_level {
+                println!("Before retain lower {}: {:?}", level, level_ssts);
+                level_ssts.retain(|id| !task.lower_level_sst_ids.contains(id));
+                println!("After retain lower {}: {:?}", level, level_ssts);
+                level_ssts.extend_from_slice(output);
+                println!("After extend lower {}: {:?}", level, level_ssts);
+            }
+        }
+
+        let new_state = LsmStorageState {
+            memtable: snapshot.memtable.clone(),
+            imm_memtables: snapshot.imm_memtables.clone(),
+            l0_sstables: new_l0_sstables,
+            levels,
+            sstables: snapshot.sstables.clone(),
+        };
+
+        (new_state, to_remove)
     }
 }
