@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use anyhow::{Ok, Result, anyhow};
 use bytes::Bytes;
@@ -174,6 +174,7 @@ pub(crate) struct LsmStorageInner {
     pub(crate) manifest: Option<Manifest>,
     pub(crate) mvcc: Option<LsmMvccInner>,
     pub(crate) compaction_filters: Arc<Mutex<Vec<CompactionFilter>>>,
+    pub(crate) is_in_compact: AtomicBool,
 }
 
 /// A thin wrapper for `LsmStorageInner` and the user interface for MiniLSM.
@@ -326,6 +327,7 @@ impl LsmStorageInner {
             options: options.into(),
             mvcc: None,
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
+            is_in_compact: AtomicBool::new(false),
         };
 
         Ok(storage)

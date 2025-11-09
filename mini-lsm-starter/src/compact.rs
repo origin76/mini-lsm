@@ -20,9 +20,10 @@ mod simple_leveled;
 mod tiered;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-use anyhow::{Ok, Result};
+use anyhow::Result;
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
 use serde::{Deserialize, Serialize};
 pub use simple_leveled::{
@@ -249,11 +250,9 @@ impl LsmStorageInner {
                         }
                     }
                     if !lower_level_ssts.is_empty() {
-                        sources_for_top_merge.push(Box::new(
-                            CompactionIterator::Concat(
-                                SstConcatIterator::create_and_seek_to_first(lower_level_ssts)?,
-                            ), 
-                        ));
+                        sources_for_top_merge.push(Box::new(CompactionIterator::Concat(
+                            SstConcatIterator::create_and_seek_to_first(lower_level_ssts)?,
+                        )));
                     }
 
                     // Create a top-level MergeIterator
@@ -273,11 +272,9 @@ impl LsmStorageInner {
                         }
                     }
                     if !upper_level_ssts.is_empty() {
-                        sources_for_top_merge.push(Box::new(
-                            CompactionIterator::Concat(
-                                SstConcatIterator::create_and_seek_to_first(upper_level_ssts)?,
-                            ), 
-                        ));
+                        sources_for_top_merge.push(Box::new(CompactionIterator::Concat(
+                            SstConcatIterator::create_and_seek_to_first(upper_level_ssts)?,
+                        )));
                     }
 
                     // 2. Process lower_level (Ln+1) SSTables: Use ConcatIterator
@@ -288,11 +285,9 @@ impl LsmStorageInner {
                         }
                     }
                     if !lower_level_ssts.is_empty() {
-                        sources_for_top_merge.push(Box::new(
-                            CompactionIterator::Concat(
-                                SstConcatIterator::create_and_seek_to_first(lower_level_ssts)?,
-                            ),
-                        ));
+                        sources_for_top_merge.push(Box::new(CompactionIterator::Concat(
+                            SstConcatIterator::create_and_seek_to_first(lower_level_ssts)?,
+                        )));
                     }
 
                     // Create a top-level MergeIterator
@@ -389,20 +384,42 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    fn trigger_compaction(&self) -> Result<()> {
-        let start = Instant::now(); // 记录开始时间
+    pub fn trigger_compaction(&self) -> Result<()> {
+        // 尝试将 is_in_compact 从 false 原子地设置为 true。
+        // 只有当它当前是 false 时，compare_exchange 才会成功 (Ok)。
+        // 如果它当前是 true，则 compare_exchange 失败 (Err)，表示有其他 compaction 正在进行。
+        match self.is_in_compact.compare_exchange(
+            false,             // 期望当前值为 `false`
+            true,              // 成功时设置为 `true`
+            Ordering::Acquire, // 成功时的内存顺序：获取语义，确保在标志设置前所有内存操作可见
+            Ordering::Relaxed, // 失败时的内存顺序：只读，无需强同步
+        ) {
+            Ok(_) => {
+                // 成功获取到“compaction 槽位”，现在可以安全地执行 compaction
+            }
+            Err(_) => {
+                // 未能将 `is_in_compact` 从 `false` 变为 `true`，说明它已经是 `true`。
+                // 这表示另一个 compaction 正在进行中，当前调用应该直接返回。
+                println!("Compaction already in progress, skipping trigger.");
+                return Ok(());
+            }
+        }
 
-
+        // Compaction 任务的实际执行逻辑
         let snapshot = self.state.read().clone();
         let Some(task) = self
             .compaction_controller
             .generate_compaction_task(&snapshot)
         else {
+            // 没有任务，立即释放锁
+            self.is_in_compact.store(false, Ordering::Release);
             return Ok(());
         };
+
         let new_ssts = self.compact(&task)?;
         let output_ids: Vec<_> = new_ssts.iter().map(|s| s.sst_id()).collect();
-        let mut state_guard = self.state.write(); // 获取写锁
+
+        let mut state_guard = self.state.write();
         let (mut new_state, to_remove) = self.compaction_controller.apply_compaction_result(
             &snapshot,
             &task,
@@ -417,18 +434,20 @@ impl LsmStorageInner {
         }
         *state_guard = Arc::new(new_state);
         std::mem::drop(state_guard);
-        let duration = start.elapsed(); // 计算经过的时间
+
+        // 在所有逻辑状态更新和文件删除前，确保标志被重置
+        // 物理删除文件
         for id in to_remove {
             let res = std::fs::remove_file(self.path_of_sst(id));
             if let Err(e) = res {
-                println!("remove fail {} {}", id, e);
+                eprintln!("remove fail {} {}", id, e); // 使用 eprintln
             }
         }
 
-        println!(
-            "函数 my_expensive_function 耗时 (毫秒): {} ms",
-            duration.as_millis()
-        );
+        // 所有操作完成后，原子地将 `is_in_compact` 设置回 `false`，释放槽位。
+        // Ordering::Release 确保所有在此之前对内存的写操作都在标志释放之前完成。
+        self.is_in_compact.store(false, Ordering::Release);
+
         Ok(())
     }
 
