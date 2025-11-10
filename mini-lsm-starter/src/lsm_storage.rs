@@ -370,11 +370,12 @@ impl LsmStorageInner {
                 // Snapshot the state to check SSTables outside the lock
                 let snapshot = self.state.read().clone();
                 let l0_sstables = snapshot.l0_sstables.clone();
-                let l1_sstables = snapshot.levels[0].1.clone();
+                let levels = snapshot.levels.clone();
                 let sstables = snapshot.sstables.clone();
                 // Lock is now released
 
                 // Check SSTables (latest to oldest)
+                // Check L0 SSTables
                 for sst_id in l0_sstables {
                     if let Some(sst) = sstables.get(&sst_id)
                         && key_slice >= sst.first_key().as_key_slice()
@@ -394,21 +395,24 @@ impl LsmStorageInner {
                     }
                 }
 
-                for sst_id in l1_sstables {
-                    if let Some(sst) = sstables.get(&sst_id)
-                        && key_slice >= sst.first_key().as_key_slice()
-                        && key_slice <= sst.last_key().as_key_slice()
-                        && sst
-                            .bloom
-                            .as_ref()
-                            .unwrap()
-                            .may_contain(farmhash::fingerprint32(key))
-                        && let Some((_k, v)) = sst.get(key_slice)?
-                    {
-                        if !v.is_empty() {
-                            return Ok(Some(v));
-                        } else {
-                            return Ok(None); // Tombstone
+                // Check all levels from L1 to max_level
+                for (_level, level_sst_ids) in levels {
+                    for sst_id in level_sst_ids {
+                        if let Some(sst) = sstables.get(&sst_id)
+                            && key_slice >= sst.first_key().as_key_slice()
+                            && key_slice <= sst.last_key().as_key_slice()
+                            && sst
+                                .bloom
+                                .as_ref()
+                                .unwrap()
+                                .may_contain(farmhash::fingerprint32(key))
+                            && let Some((_k, v)) = sst.get(key_slice)?
+                        {
+                            if !v.is_empty() {
+                                return Ok(Some(v));
+                            } else {
+                                return Ok(None); // Tombstone
+                            }
                         }
                     }
                 }
@@ -478,50 +482,101 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        // 1. 进入临界区，抓取 `_state_lock` 以及读锁 state，提取必要信息
-        let (memtable_to_flush, curr_state_snapshot, sst_id);
-        {
-            let _state_lock = self.state_lock.lock();
-            let state_guard = self.state.read();
+        // 外层循环用于重试整个过程，直到成功更新状态或者确定无需刷新
+        loop {
+            let memtable_to_flush_id; // 只需要ID来标识，实际的MemTable可能需要重新获取
+            let sst_id;
+            let old_state_arc; // RwLock中当前最新的Arc<LsmStorageState>
 
-            memtable_to_flush = state_guard
+            // 1. 获取当前状态的快照，并决定要刷新的MemTable
+            {
+                let state_read_guard = self.state.read();
+                old_state_arc = state_read_guard.clone(); // 克隆内部的Arc<LsmStorageState>
+
+                // 如果 imm_memtables 为空，则没有可刷新的，直接返回
+                if old_state_arc.imm_memtables.is_empty() {
+                    return Ok(());
+                }
+
+                memtable_to_flush_id = old_state_arc
+                    .imm_memtables
+                    .last()
+                    .expect("imm_memtables should not be empty here, checked above.")
+                    .id(); // 只需要ID，MemTable对象本身可能不需要在锁外传递
+
+                // 确保 next_sst_id 是线程安全的（例如，使用 AtomicUsize）
+                sst_id = self.next_sst_id();
+            } // 读锁在这里释放
+
+            // 2. 锁外进行耗时操作 (刷盘)
+            // 从 old_state_arc 中获取 memtable_to_flush_id 对应的 MemTable 实例
+            // 这里需要小心：如果 memtable_to_flush_id 对应的 MemTable 已经被移除，那么这里可能会失败。
+            // 最安全的做法是，在最初获取到 memtable_to_flush 的时候，就克隆其内容，而不是克隆 Arc，
+            // 这样即使其原始 Arc 被替换，你手里的内容依然有效。
+            let memtable_to_flush_instance = old_state_arc
+                .imm_memtables
+                .iter()
+                .find(|m| m.id() == memtable_to_flush_id)
+                .cloned() // 克隆 ImmutableMemtable 的内容
+                .expect("Memtable to flush not found in snapshot, should not happen after check.");
+
+            let mut builder = SsTableBuilder::new(self.options.block_size);
+            memtable_to_flush_instance.flush(&mut builder)?; // 使用克隆的内容进行刷盘
+            let path = self.path_of_sst(sst_id);
+            let sstable = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
+
+            // 3. 进入临界区，获取写锁并尝试更新状态
+            let mut state_write_guard = self.state.write();
+
+            // 关键步骤：在持有写锁时，重新检查并基于最新的状态进行操作
+            let latest_state_arc_in_lock = state_write_guard.clone(); // 获取RwLock中当前最新的Arc<LsmStorageState>
+
+            // a) 检查 imm_memtables 是否仍然为空，或者要刷新的 MemTable 是否依然是最后一个。
+            if latest_state_arc_in_lock.imm_memtables.is_empty() {
+                // 在耗时操作期间，imm_memtables 被清空了。
+                // 本次 flush 任务已经不需要执行，直接成功返回。
+                return Ok(());
+            }
+
+            // 检查 `memtable_to_flush_id` 是否仍然是 `imm_memtables` 列表中的最后一个。
+            // 如果不是，说明在耗时操作期间，列表被修改了（可能是另一个 flush 完成了，
+            // 或者有新的 imm_memtable 被添加到末尾）。
+            // 这种情况下，本次 flush 尝试是无效的，需要放弃并重试整个循环。
+            if latest_state_arc_in_lock
                 .imm_memtables
                 .last()
-                .cloned()
-                .expect("No immutable memtable to flush");
-            curr_state_snapshot = state_guard.clone();
-            sst_id = self.next_sst_id();
+                .map(|m| m.id())
+                != Some(memtable_to_flush_id)
+            {
+                // 状态已变更，放弃本次更新，回到循环开头重试
+                continue;
+            }
+            // 如果代码执行到这里，说明 memtable_to_flush_id 仍然是 imm_memtables 列表的最后一个元素，
+            // 并且列表不为空。我们可以安全地基于 latest_state_arc_in_lock 进行修改。
 
-            // state_guard 在此块末尾 drop
-            // _state_lock 也在此块末尾 drop
+            // b) 基于最新状态 latest_state_arc_in_lock 构建新的状态
+            let mut imm_memtables = latest_state_arc_in_lock.imm_memtables.clone();
+            imm_memtables.pop(); // 移除最新的 imm_memtable
+            let mut l0_sstables = latest_state_arc_in_lock.l0_sstables.clone();
+            l0_sstables.insert(0, sst_id);
+            let mut sstables = latest_state_arc_in_lock.sstables.clone();
+            sstables.insert(sst_id, Arc::new(sstable));
+
+            let new_state_arc = Arc::new(LsmStorageState {
+                memtable: latest_state_arc_in_lock.memtable.clone(),
+                imm_memtables,
+                l0_sstables,
+                levels: latest_state_arc_in_lock.levels.clone(),
+                sstables,
+            });
+
+            // c) 原子替换 RwLock 内部的 Arc<LsmStorageState>
+            *state_write_guard = new_state_arc;
+
+            // 成功更新，退出循环
+            return Ok(());
         }
-
-        // 2. 锁外进行耗时操作
-        let mut builder = SsTableBuilder::new(self.options.block_size);
-        memtable_to_flush.flush(&mut builder)?;
-        let path = self.path_of_sst(sst_id);
-        let sstable = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
-
-        // 3. 构造新状态并写回
-        let mut imm_memtables = curr_state_snapshot.imm_memtables.clone();
-        imm_memtables.pop();
-        let mut l0_sstables = curr_state_snapshot.l0_sstables.clone();
-        l0_sstables.insert(0, sst_id);
-        let mut sstables = curr_state_snapshot.sstables.clone();
-        sstables.insert(sst_id, Arc::new(sstable));
-
-        let new_state = Arc::new(LsmStorageState {
-            memtable: curr_state_snapshot.memtable.clone(),
-            imm_memtables,
-            l0_sstables,
-            levels: curr_state_snapshot.levels.clone(),
-            sstables,
-        });
-
-        *(self.state.write()) = new_state;
-        Ok(())
     }
-
     pub fn new_txn(&self) -> Result<()> {
         // no-op
         Ok(())
@@ -547,6 +602,7 @@ impl LsmStorageInner {
 
         // ---- Step 2: Clone SST Info ----
         let l0_sstables = lock.l0_sstables.clone();
+        let levels = lock.levels.clone();
         let sstables = lock.sstables.clone();
         drop(lock);
 
@@ -557,6 +613,7 @@ impl LsmStorageInner {
             Bound::Unbounded => KeySlice::from_slice(b""),
         };
 
+        // Handle L0 SSTables
         for sst_id in l0_sstables {
             if let Some(sst) = sstables.get(&sst_id) {
                 let table_lower = sst.first_key().raw_ref();
@@ -581,43 +638,50 @@ impl LsmStorageInner {
             }
         }
 
-        let l1_sst_id = self.state.read().levels[0].1.clone(); // 获取 l1 层的 SST ID 列表
-        let l1_sst_iter;
+        // Create iterators for all levels
+        let mut level_iters: Vec<SstConcatIterator> = Vec::new();
+        for (_level, level_sst_ids) in levels {
+            if level_sst_ids.is_empty() {
+                continue;
+            }
 
-        let sstables = self.state.read().sstables.clone(); // 获取所有 SST 文件的 HashMap
+            // Create ordered SSTs for this level
+            let mut ordered_ssts = Vec::new();
+            for sst_id in level_sst_ids {
+                if let Some(sst) = sstables.get(&sst_id) {
+                    ordered_ssts.push(sst.clone());
+                }
+            }
 
-        // 创建一个新的 Vec，用于存放按顺序提取的 SST 文件
-        let mut ordered_ssts = Vec::new();
+            if ordered_ssts.is_empty() {
+                continue;
+            }
 
-        // 按照 l1_sst_id 的顺序，提取 sstables 中对应的元素
-        for sst_id in l1_sst_id {
-            if let Some(sst) = sstables.get(&sst_id) {
-                ordered_ssts.push(sst.clone()); // 将对应的 SST 文件添加到新 Vec 中
-            }
-        }
-        match lower {
-            Bound::Unbounded => {
-                l1_sst_iter = SstConcatIterator::create_and_seek_to_first(ordered_ssts)?;
-            }
-            Bound::Excluded(low) => {
-                l1_sst_iter = SstConcatIterator::create_and_seek_to_key(
-                    ordered_ssts,
-                    KeySlice::from_slice(low),
-                )?;
-            }
-            Bound::Included(low) => {
-                l1_sst_iter = SstConcatIterator::create_and_seek_to_key(
-                    ordered_ssts,
-                    KeySlice::from_slice(low),
-                )?;
-            }
+            // Create SstConcatIterator for this level
+            let level_iter = match &lower {
+                Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(ordered_ssts)?,
+                Bound::Excluded(low) | Bound::Included(low) => {
+                    SstConcatIterator::create_and_seek_to_key(
+                        ordered_ssts,
+                        KeySlice::from_slice(low),
+                    )?
+                }
+            };
+
+            level_iters.push(level_iter);
         }
 
         // ---- Step 4: Merge and return ----
         let sst_iter = MergeIterator::create(sst_children);
-        let l0_merge_iter = TwoMergeIterator::create(memtable_iter, sst_iter)?;
-        let two_merge_iter = TwoMergeIterator::create(l0_merge_iter, l1_sst_iter)?;
-        let iter = LsmIterator::new(two_merge_iter, upper.map(Bytes::copy_from_slice))?;
+
+        // Merge all level iterators
+        let level_merge = MergeIterator::create(level_iters.into_iter().map(Box::new).collect());
+
+        // Merge memtable + L0 with all levels
+        let mem_l0 = TwoMergeIterator::create(memtable_iter, sst_iter)?;
+        let final_iter = TwoMergeIterator::create(mem_l0, level_merge)?;
+
+        let iter = LsmIterator::new(final_iter, upper.map(Bytes::copy_from_slice))?;
         Ok(FusedIterator::new(iter))
     }
 }
