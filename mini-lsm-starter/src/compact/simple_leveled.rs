@@ -102,15 +102,6 @@ impl SimpleLeveledCompactionController {
             .chain(task.lower_level_sst_ids.iter())
             .cloned()
             .collect::<Vec<_>>();
-        println!(
-            "to remove {:?} upper {} lower {}",
-            to_remove,
-            task.upper_level.unwrap_or(999),
-            task.lower_level
-        );
-        println!("upper sstid {:?}", task.upper_level_sst_ids);
-        println!("lower sstid {:?}", task.lower_level_sst_ids);
-        println!(" new output {:?}", output);
 
         let mut levels = snapshot.levels.clone();
 
@@ -130,16 +121,11 @@ impl SimpleLeveledCompactionController {
         for (idx, (_, level_ssts)) in levels.iter_mut().enumerate() {
             let level = idx + 1; // levels[0] is L1
             if Some(level) == task.upper_level {
-                println!("Before retain upper {}: {:?}", level, level_ssts);
                 level_ssts.retain(|id| !task.upper_level_sst_ids.contains(id));
-                println!("After retain upper {}: {:?}", level, level_ssts);
             }
             if level == task.lower_level {
-                println!("Before retain lower {}: {:?}", level, level_ssts);
                 level_ssts.retain(|id| !task.lower_level_sst_ids.contains(id));
-                println!("After retain lower {}: {:?}", level, level_ssts);
                 level_ssts.extend_from_slice(output);
-                println!("After extend lower {}: {:?}", level, level_ssts);
             }
         }
 

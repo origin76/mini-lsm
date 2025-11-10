@@ -21,7 +21,7 @@ mod tiered;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
@@ -222,79 +222,77 @@ impl LsmStorageInner {
                 let mut new_ssts = Vec::new();
                 let mut builder = SsTableBuilder::new(self.options.block_size);
 
-                let final_compaction_iterator: Box<CompactionIterator>; // <--- 关键修改点：使用 Box<CompactionIterator>
+                let final_compaction_iterator: Box<CompactionIterator> =
+                    if task.upper_level.is_none() {
+                        // Determine if it's an L0 compaction (merging L0 with L1)
+                        // --- L0 -> L1 Compaction: MergeIterator combining L0 SsTableIterators and L1 ConcatIterator ---
+                        let mut sources_for_top_merge: Vec<Box<CompactionIterator>> = Vec::new(); // <--- 关键修改点
 
-                // Determine if it's an L0 compaction (merging L0 with L1)
-                if task.upper_level.is_none() {
-                    // --- L0 -> L1 Compaction: MergeIterator combining L0 SsTableIterators and L1 ConcatIterator ---
-
-                    let mut sources_for_top_merge: Vec<Box<CompactionIterator>> = Vec::new(); // <--- 关键修改点
-
-                    // 1. Process L0 SSTables: Each L0 SSTable needs its own SsTableIterator
-                    for &id in &task.upper_level_sst_ids {
-                        // These are L0 SST IDs
-                        if let Some(sst) = sstables_map.get(&id) {
-                            sources_for_top_merge.push(Box::new(
-                                CompactionIterator::SsTable(
-                                    SsTableIterator::create_and_seek_to_first(sst.clone())?,
-                                ), // <--- 关键修改点
-                            ));
+                        // 1. Process L0 SSTables: Each L0 SSTable needs its own SsTableIterator
+                        for &id in &task.upper_level_sst_ids {
+                            // These are L0 SST IDs
+                            if let Some(sst) = sstables_map.get(&id) {
+                                sources_for_top_merge.push(Box::new(
+                                    CompactionIterator::SsTable(
+                                        SsTableIterator::create_and_seek_to_first(sst.clone())?,
+                                    ), // <--- 关键修改点
+                                ));
+                            }
                         }
-                    }
 
-                    // 2. Process L1 SSTables: Use a single ConcatIterator for them.
-                    let mut lower_level_ssts = Vec::new(); // These are L1 SST IDs
-                    for &id in &task.lower_level_sst_ids {
-                        if let Some(sst) = sstables_map.get(&id) {
-                            lower_level_ssts.push(sst.clone());
+                        // 2. Process L1 SSTables: Use a single ConcatIterator for them.
+                        let mut lower_level_ssts = Vec::new(); // These are L1 SST IDs
+                        for &id in &task.lower_level_sst_ids {
+                            if let Some(sst) = sstables_map.get(&id) {
+                                lower_level_ssts.push(sst.clone());
+                            }
                         }
-                    }
-                    if !lower_level_ssts.is_empty() {
-                        sources_for_top_merge.push(Box::new(CompactionIterator::Concat(
-                            SstConcatIterator::create_and_seek_to_first(lower_level_ssts)?,
-                        )));
-                    }
-
-                    // Create a top-level MergeIterator
-                    final_compaction_iterator = Box::new(
-                        CompactionIterator::Merge(MergeIterator::create(sources_for_top_merge)), // <--- 关键修改点
-                    );
-                } else {
-                    // --- Leveled Compaction (Ln -> Ln+1, where n > 0): MergeIterator of ConcatIterators ---
-
-                    let mut sources_for_top_merge: Vec<Box<CompactionIterator>> = Vec::new();
-
-                    // 1. Process upper_level (Ln) SSTables: Use ConcatIterator
-                    let mut upper_level_ssts = Vec::new();
-                    for &id in &task.upper_level_sst_ids {
-                        if let Some(sst) = sstables_map.get(&id) {
-                            upper_level_ssts.push(sst.clone());
+                        if !lower_level_ssts.is_empty() {
+                            sources_for_top_merge.push(Box::new(CompactionIterator::Concat(
+                                SstConcatIterator::create_and_seek_to_first(lower_level_ssts)?,
+                            )));
                         }
-                    }
-                    if !upper_level_ssts.is_empty() {
-                        sources_for_top_merge.push(Box::new(CompactionIterator::Concat(
-                            SstConcatIterator::create_and_seek_to_first(upper_level_ssts)?,
-                        )));
-                    }
 
-                    // 2. Process lower_level (Ln+1) SSTables: Use ConcatIterator
-                    let mut lower_level_ssts = Vec::new();
-                    for &id in &task.lower_level_sst_ids {
-                        if let Some(sst) = sstables_map.get(&id) {
-                            lower_level_ssts.push(sst.clone());
+                        // Create a top-level MergeIterator
+                        Box::new(
+                            CompactionIterator::Merge(MergeIterator::create(sources_for_top_merge)), // <--- 关键修改点
+                        )
+                    } else {
+                        // --- Leveled Compaction (Ln -> Ln+1, where n > 0): MergeIterator of ConcatIterators ---
+
+                        let mut sources_for_top_merge: Vec<Box<CompactionIterator>> = Vec::new();
+
+                        // 1. Process upper_level (Ln) SSTables: Use ConcatIterator
+                        let mut upper_level_ssts = Vec::new();
+                        for &id in &task.upper_level_sst_ids {
+                            if let Some(sst) = sstables_map.get(&id) {
+                                upper_level_ssts.push(sst.clone());
+                            }
                         }
-                    }
-                    if !lower_level_ssts.is_empty() {
-                        sources_for_top_merge.push(Box::new(CompactionIterator::Concat(
-                            SstConcatIterator::create_and_seek_to_first(lower_level_ssts)?,
-                        )));
-                    }
+                        if !upper_level_ssts.is_empty() {
+                            sources_for_top_merge.push(Box::new(CompactionIterator::Concat(
+                                SstConcatIterator::create_and_seek_to_first(upper_level_ssts)?,
+                            )));
+                        }
 
-                    // Create a top-level MergeIterator
-                    final_compaction_iterator = Box::new(
-                        CompactionIterator::Merge(MergeIterator::create(sources_for_top_merge)), // <--- 关键修改点
-                    );
-                }
+                        // 2. Process lower_level (Ln+1) SSTables: Use ConcatIterator
+                        let mut lower_level_ssts = Vec::new();
+                        for &id in &task.lower_level_sst_ids {
+                            if let Some(sst) = sstables_map.get(&id) {
+                                lower_level_ssts.push(sst.clone());
+                            }
+                        }
+                        if !lower_level_ssts.is_empty() {
+                            sources_for_top_merge.push(Box::new(CompactionIterator::Concat(
+                                SstConcatIterator::create_and_seek_to_first(lower_level_ssts)?,
+                            )));
+                        }
+
+                        // Create a top-level MergeIterator
+                        Box::new(
+                            CompactionIterator::Merge(MergeIterator::create(sources_for_top_merge)), // <--- 关键修改点
+                        )
+                    };
 
                 let mut merge_iter = final_compaction_iterator; // Now it's Box<CompactionIterator>
 
@@ -385,25 +383,18 @@ impl LsmStorageInner {
     }
 
     pub fn trigger_compaction(&self) -> Result<()> {
-        // 尝试将 is_in_compact 从 false 原子地设置为 true。
-        // 只有当它当前是 false 时，compare_exchange 才会成功 (Ok)。
-        // 如果它当前是 true，则 compare_exchange 失败 (Err)，表示有其他 compaction 正在进行。
         match self.is_in_compact.compare_exchange(
             false,             // 期望当前值为 `false`
             true,              // 成功时设置为 `true`
             Ordering::Acquire, // 成功时的内存顺序：获取语义，确保在标志设置前所有内存操作可见
             Ordering::Relaxed, // 失败时的内存顺序：只读，无需强同步
         ) {
-            Ok(_) => {
-                // 成功获取到“compaction 槽位”，现在可以安全地执行 compaction
-            }
+            Ok(_) => {}
             Err(_) => {
-                // 未能将 `is_in_compact` 从 `false` 变为 `true`，说明它已经是 `true`。
-                // 这表示另一个 compaction 正在进行中，当前调用应该直接返回。
-                println!("Compaction already in progress, skipping trigger.");
                 return Ok(());
             }
         }
+        let start_time = Instant::now(); // 可选：测量耗时
 
         // Compaction 任务的实际执行逻辑
         let snapshot = self.state.read().clone();
@@ -411,7 +402,6 @@ impl LsmStorageInner {
             .compaction_controller
             .generate_compaction_task(&snapshot)
         else {
-            // 没有任务，立即释放锁
             self.is_in_compact.store(false, Ordering::Release);
             return Ok(());
         };
@@ -420,8 +410,9 @@ impl LsmStorageInner {
         let output_ids: Vec<_> = new_ssts.iter().map(|s| s.sst_id()).collect();
 
         let mut state_guard = self.state.write();
+        let current_state = state_guard.clone();
         let (mut new_state, to_remove) = self.compaction_controller.apply_compaction_result(
-            &snapshot,
+            &current_state,
             &task,
             &output_ids,
             false,
@@ -434,13 +425,14 @@ impl LsmStorageInner {
         }
         *state_guard = Arc::new(new_state);
         std::mem::drop(state_guard);
+        let duration = start_time.elapsed(); // 可选：测量耗时
 
         // 在所有逻辑状态更新和文件删除前，确保标志被重置
         // 物理删除文件
         for id in to_remove {
             let res = std::fs::remove_file(self.path_of_sst(id));
             if let Err(e) = res {
-                eprintln!("remove fail {} {}", id, e); // 使用 eprintln
+                println!("remove fail {} {}", id, e); // 使用 eprintln
             }
         }
 
