@@ -558,15 +558,22 @@ impl LsmStorageInner {
             let mut imm_memtables = latest_state_arc_in_lock.imm_memtables.clone();
             imm_memtables.pop(); // 移除最新的 imm_memtable
             let mut l0_sstables = latest_state_arc_in_lock.l0_sstables.clone();
-            l0_sstables.insert(0, sst_id);
+            let mut levels = latest_state_arc_in_lock.levels.clone();
             let mut sstables = latest_state_arc_in_lock.sstables.clone();
             sstables.insert(sst_id, Arc::new(sstable));
+
+            if self.compaction_controller.flush_to_l0() {
+                l0_sstables.insert(0, sst_id);
+            } else {
+                // Tiered compaction: flush to new tier
+                levels.insert(0, (sst_id, vec![sst_id]));
+            }
 
             let new_state_arc = Arc::new(LsmStorageState {
                 memtable: latest_state_arc_in_lock.memtable.clone(),
                 imm_memtables,
                 l0_sstables,
-                levels: latest_state_arc_in_lock.levels.clone(),
+                levels,
                 sstables,
             });
 

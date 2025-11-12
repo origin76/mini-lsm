@@ -226,10 +226,6 @@ impl StorageIterator for MemTableIterator {
             }
         }
 
-        self.with_item(|item| {
-            println!("item.0 {:?} item.1 {:?}", item.0, item.1);
-        });
-
         Ok(())
     }
 }

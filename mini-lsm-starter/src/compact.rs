@@ -318,6 +318,53 @@ impl LsmStorageInner {
                 }
                 Ok(new_ssts)
             }
+            CompactionTask::Tiered(task) => {
+                let snapshot = self.state.read().clone();
+                let sstables_map = &snapshot.sstables;
+
+                let mut new_ssts = Vec::new();
+                let mut builder = SsTableBuilder::new(self.options.block_size);
+
+                // Collect all SSTs from all tiers in the task
+                let mut all_ssts = Vec::new();
+                for (tier_id, sst_ids) in &task.tiers {
+                    for &sst_id in sst_ids {
+                        if let Some(sst) = sstables_map.get(&sst_id) {
+                            all_ssts.push(sst.clone());
+                        }
+                    }
+                }
+
+                // Create a MergeIterator over all SSTs
+                let mut sst_iters: Vec<Box<SsTableIterator>> = Vec::new();
+                for sst in all_ssts {
+                    let iter = SsTableIterator::create_and_seek_to_first(sst)?;
+                    sst_iters.push(Box::new(iter));
+                }
+                let mut merge_iter = MergeIterator::create(sst_iters);
+
+                // Build new SSTs
+                while merge_iter.is_valid() {
+                    if !merge_iter.value().is_empty() {
+                        builder.add(merge_iter.key(), merge_iter.value());
+                    }
+                    merge_iter.next()?;
+                    if builder.estimated_size() >= self.options.target_sst_size {
+                        let sst_id = self.next_sst_id();
+                        let path = self.path_of_sst(sst_id);
+                        let sst = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
+                        new_ssts.push(Arc::new(sst));
+                        builder = SsTableBuilder::new(self.options.block_size);
+                    }
+                }
+                if !builder.is_empty() {
+                    let sst_id = self.next_sst_id();
+                    let path = self.path_of_sst(sst_id);
+                    let sst = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
+                    new_ssts.push(Arc::new(sst));
+                }
+                Ok(new_ssts)
+            }
             _ => unimplemented!(),
         }
     }
