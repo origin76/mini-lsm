@@ -376,21 +376,23 @@ impl LsmStorageInner {
 
                 // Check SSTables (latest to oldest)
                 // Check L0 SSTables
-                for sst_id in l0_sstables {
-                    if let Some(sst) = sstables.get(&sst_id)
-                        && key_slice >= sst.first_key().as_key_slice()
-                        && key_slice <= sst.last_key().as_key_slice()
-                        && sst
-                            .bloom
-                            .as_ref()
-                            .unwrap()
-                            .may_contain(farmhash::fingerprint32(key))
-                        && let Some((_k, v)) = sst.get(key_slice)?
-                    {
-                        if !v.is_empty() {
-                            return Ok(Some(v));
-                        } else {
-                            return Ok(None); // Tombstone
+                if self.compaction_controller.flush_to_l0() {
+                    for sst_id in l0_sstables {
+                        if let Some(sst) = sstables.get(&sst_id)
+                            && key_slice >= sst.first_key().as_key_slice()
+                            && key_slice <= sst.last_key().as_key_slice()
+                            && sst
+                                .bloom
+                                .as_ref()
+                                .unwrap()
+                                .may_contain(farmhash::fingerprint32(key))
+                            && let Some((_k, v)) = sst.get(key_slice)?
+                        {
+                            if !v.is_empty() {
+                                return Ok(Some(v));
+                            } else {
+                                return Ok(None); // Tombstone
+                            }
                         }
                     }
                 }
@@ -621,26 +623,29 @@ impl LsmStorageInner {
         };
 
         // Handle L0 SSTables
-        for sst_id in l0_sstables {
-            if let Some(sst) = sstables.get(&sst_id) {
-                let table_lower = sst.first_key().raw_ref();
-                let table_upper = sst.last_key().raw_ref();
+        if self.compaction_controller.flush_to_l0() {
+            for sst_id in l0_sstables {
+                if let Some(sst) = sstables.get(&sst_id) {
+                    let table_lower = sst.first_key().raw_ref();
+                    let table_upper = sst.last_key().raw_ref();
 
-                if table_out_of_range(&lower, &upper, table_lower, table_upper) {
-                    continue;
-                }
+                    if table_out_of_range(&lower, &upper, table_lower, table_upper) {
+                        continue;
+                    }
 
-                let mut it = SsTableIterator::create_and_seek_to_key(sst.clone(), lower_key_slice)?;
+                    let mut it =
+                        SsTableIterator::create_and_seek_to_key(sst.clone(), lower_key_slice)?;
 
-                if let Bound::Excluded(excl) = &lower
-                    && it.is_valid()
-                    && it.key() == KeySlice::from_slice(excl)
-                {
-                    it.next()?;
-                }
+                    if let Bound::Excluded(excl) = &lower
+                        && it.is_valid()
+                        && it.key() == KeySlice::from_slice(excl)
+                    {
+                        it.next()?;
+                    }
 
-                if it.is_valid() {
-                    sst_children.push(Box::new(it));
+                    if it.is_valid() {
+                        sst_children.push(Box::new(it));
+                    }
                 }
             }
         }
