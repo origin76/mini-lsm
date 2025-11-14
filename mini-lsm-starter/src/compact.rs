@@ -365,7 +365,43 @@ impl LsmStorageInner {
                 }
                 Ok(new_ssts)
             }
-            _ => unimplemented!(),
+            CompactionTask::Leveled(task) => {
+                let snapshot = self.state.read().clone();
+                let sstables = &snapshot.sstables;
+                let mut all_ids = task.upper_level_sst_ids.clone();
+                all_ids.extend_from_slice(&task.lower_level_sst_ids);
+                let mut iterators: Vec<Box<SsTableIterator>> = Vec::new();
+                for &id in &all_ids {
+                    if let Some(sst) = sstables.get(&id) {
+                        let iter = SsTableIterator::create_and_seek_to_first(sst.clone())?;
+                        iterators.push(Box::new(iter));
+                    }
+                }
+                let mut merge_iter: MergeIterator<SsTableIterator> =
+                    MergeIterator::create(iterators);
+                let mut new_ssts = Vec::new();
+                let mut builder = SsTableBuilder::new(self.options.block_size);
+                while merge_iter.is_valid() {
+                    if !merge_iter.value().is_empty() {
+                        builder.add(merge_iter.key(), merge_iter.value());
+                    }
+                    merge_iter.next()?;
+                    if builder.estimated_size() >= self.options.target_sst_size {
+                        let sst_id = self.next_sst_id();
+                        let path = self.path_of_sst(sst_id);
+                        let sst = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
+                        new_ssts.push(Arc::new(sst));
+                        builder = SsTableBuilder::new(self.options.block_size);
+                    }
+                }
+                if !builder.is_empty() {
+                    let sst_id = self.next_sst_id();
+                    let path = self.path_of_sst(sst_id);
+                    let sst = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
+                    new_ssts.push(Arc::new(sst));
+                }
+                Ok(new_ssts)
+            }
         }
     }
 
