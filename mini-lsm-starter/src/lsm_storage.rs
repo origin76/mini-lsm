@@ -399,7 +399,18 @@ impl LsmStorageInner {
 
                 // Check all levels from L1 to max_level
                 for (_level, level_sst_ids) in levels {
-                    for sst_id in level_sst_ids {
+                    if level_sst_ids.is_empty() {
+                        continue;
+                    }
+                    // Binary search to find the SST that may contain the key
+                    let pos = level_sst_ids.partition_point(|&id| {
+                        sstables
+                            .get(&id)
+                            .map(|sst| sst.first_key().as_key_slice() <= key_slice)
+                            .unwrap_or(false)
+                    });
+                    if pos > 0 {
+                        let sst_id = level_sst_ids[pos - 1];
                         if let Some(sst) = sstables.get(&sst_id)
                             && key_slice >= sst.first_key().as_key_slice()
                             && key_slice <= sst.last_key().as_key_slice()

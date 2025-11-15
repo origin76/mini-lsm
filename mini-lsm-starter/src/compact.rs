@@ -367,20 +367,81 @@ impl LsmStorageInner {
             }
             CompactionTask::Leveled(task) => {
                 let snapshot = self.state.read().clone();
-                let sstables = &snapshot.sstables;
-                let mut all_ids = task.upper_level_sst_ids.clone();
-                all_ids.extend_from_slice(&task.lower_level_sst_ids);
-                let mut iterators: Vec<Box<SsTableIterator>> = Vec::new();
-                for &id in &all_ids {
-                    if let Some(sst) = sstables.get(&id) {
-                        let iter = SsTableIterator::create_and_seek_to_first(sst.clone())?;
-                        iterators.push(Box::new(iter));
-                    }
-                }
-                let mut merge_iter: MergeIterator<SsTableIterator> =
-                    MergeIterator::create(iterators);
+                let sstables_map = &snapshot.sstables;
+
                 let mut new_ssts = Vec::new();
                 let mut builder = SsTableBuilder::new(self.options.block_size);
+
+                let final_compaction_iterator: Box<CompactionIterator> =
+                    if task.upper_level.is_none() {
+                        // L0 -> L1 Compaction: MergeIterator combining L0 SsTableIterators and L1 ConcatIterator
+                        let mut sources_for_top_merge: Vec<Box<CompactionIterator>> = Vec::new();
+
+                        // 1. Process L0 SSTables: Each L0 SSTable needs its own SsTableIterator
+                        for &id in &task.upper_level_sst_ids {
+                            if let Some(sst) = sstables_map.get(&id) {
+                                sources_for_top_merge.push(Box::new(CompactionIterator::SsTable(
+                                    SsTableIterator::create_and_seek_to_first(sst.clone())?,
+                                )));
+                            }
+                        }
+
+                        // 2. Process L1 SSTables: Use a single ConcatIterator for them.
+                        let mut lower_level_ssts = Vec::new();
+                        for &id in &task.lower_level_sst_ids {
+                            if let Some(sst) = sstables_map.get(&id) {
+                                lower_level_ssts.push(sst.clone());
+                            }
+                        }
+                        if !lower_level_ssts.is_empty() {
+                            sources_for_top_merge.push(Box::new(CompactionIterator::Concat(
+                                SstConcatIterator::create_and_seek_to_first(lower_level_ssts)?,
+                            )));
+                        }
+
+                        // Create a top-level MergeIterator
+                        Box::new(CompactionIterator::Merge(MergeIterator::create(
+                            sources_for_top_merge,
+                        )))
+                    } else {
+                        // Leveled Compaction (Ln -> Ln+1, where n > 0): MergeIterator of ConcatIterators
+                        let mut sources_for_top_merge: Vec<Box<CompactionIterator>> = Vec::new();
+
+                        // 1. Process upper_level (Ln) SSTables: Use ConcatIterator
+                        let mut upper_level_ssts = Vec::new();
+                        for &id in &task.upper_level_sst_ids {
+                            if let Some(sst) = sstables_map.get(&id) {
+                                upper_level_ssts.push(sst.clone());
+                            }
+                        }
+                        if !upper_level_ssts.is_empty() {
+                            sources_for_top_merge.push(Box::new(CompactionIterator::Concat(
+                                SstConcatIterator::create_and_seek_to_first(upper_level_ssts)?,
+                            )));
+                        }
+
+                        // 2. Process lower_level (Ln+1) SSTables: Use ConcatIterator
+                        let mut lower_level_ssts = Vec::new();
+                        for &id in &task.lower_level_sst_ids {
+                            if let Some(sst) = sstables_map.get(&id) {
+                                lower_level_ssts.push(sst.clone());
+                            }
+                        }
+                        if !lower_level_ssts.is_empty() {
+                            sources_for_top_merge.push(Box::new(CompactionIterator::Concat(
+                                SstConcatIterator::create_and_seek_to_first(lower_level_ssts)?,
+                            )));
+                        }
+
+                        // Create a top-level MergeIterator
+                        Box::new(CompactionIterator::Merge(MergeIterator::create(
+                            sources_for_top_merge,
+                        )))
+                    };
+
+                let mut merge_iter = final_compaction_iterator;
+
+                // The rest of the logic for building new SSTs remains the same:
                 while merge_iter.is_valid() {
                     if !merge_iter.value().is_empty() {
                         builder.add(merge_iter.key(), merge_iter.value());

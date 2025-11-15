@@ -103,29 +103,26 @@ impl LeveledCompactionController {
 
     /// Get level size in bytes
     fn get_level_size(&self, level: usize, snapshot: &LsmStorageState) -> usize {
-        let res = {
-            if level == 0 {
-                // L0 size - sum of all L0 SSTs
-                snapshot
-                    .l0_sstables
+        if level == 0 {
+            // L0 size - sum of all L0 SSTs
+            snapshot
+                .l0_sstables
+                .iter()
+                .filter_map(|id| snapshot.sstables.get(id))
+                .map(|sst| sst.table_size())
+                .sum::<u64>() as usize
+        } else {
+            // L1+ size
+            if let Some((_, sst_ids)) = snapshot.levels.get(level - 1) {
+                sst_ids
                     .iter()
                     .filter_map(|id| snapshot.sstables.get(id))
                     .map(|sst| sst.table_size())
                     .sum::<u64>() as usize
             } else {
-                // L1+ size
-                if let Some((_, sst_ids)) = snapshot.levels.get(level - 1) {
-                    sst_ids
-                        .iter()
-                        .filter_map(|id| snapshot.sstables.get(id))
-                        .map(|sst| sst.table_size())
-                        .sum::<u64>() as usize
-                } else {
-                    panic!()
-                }
+                0
             }
-        };
-        return res;
+        }
     }
 
     /// Find overlapping SSTs in the lower level with the given SSTs
@@ -216,11 +213,7 @@ impl LeveledCompactionController {
             }
         }
 
-        if let Some(level) = best_level {
-            Some((level, level + 1))
-        } else {
-            None
-        }
+        best_level.map(|level| (level, level + 1))
     }
 
     /// Pick SSTs for compaction from the given level based on size or other strategies
@@ -319,27 +312,16 @@ impl LeveledCompactionController {
         }
 
         // Remove input SSTs from lower level
-        if task.lower_level >= 1 {
-            // Ensure the levels vec has enough entries
-            while new_state.levels.len() < task.lower_level {
-                new_state
-                    .levels
-                    .push((new_state.levels.len() + 1, Vec::new()));
-            }
-
-            if let Some((_, level_ssts)) = new_state.levels.get_mut(task.lower_level - 1) {
-                level_ssts.retain(|id| !task.lower_level_sst_ids.contains(id));
-                level_ssts.extend_from_slice(output);
-
-                // Sort by first key to maintain sorted order
-                level_ssts.sort_by_key(|id| {
-                    new_state
-                        .sstables
-                        .get(id)
-                        .map(|sst| sst.first_key().clone())
-                        .unwrap_or_else(|| crate::key::KeyBytes::default())
-                });
-            }
+        if task.lower_level >= 1
+            && let Some((_, level_ssts)) = new_state.levels.get_mut(task.lower_level - 1)
+        {
+            let insert_pos = level_ssts
+                .iter()
+                .position(|id| task.lower_level_sst_ids.contains(id))
+                .unwrap_or(level_ssts.len());
+            level_ssts.retain(|id| !task.lower_level_sst_ids.contains(id));
+            let insert_pos = insert_pos.min(level_ssts.len());
+            level_ssts.splice(insert_pos..insert_pos, output.iter().cloned());
         }
 
         (new_state, to_remove)
