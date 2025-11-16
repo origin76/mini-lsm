@@ -38,7 +38,7 @@ use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::table::{SsTable, SsTableBuilder, iterator::SsTableIterator};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CompactionTask {
     Leveled(LeveledCompactionTask),
     Tiered(TieredCompactionTask),
@@ -494,6 +494,17 @@ impl LsmStorageInner {
         let new_ssts = self.compact(&task)?;
         let new_sst_ids: Vec<_> = new_ssts.iter().map(|i| i.sst_id()).collect();
 
+        // Sync directory after writing new SST files
+        self.sync_dir()?;
+
+        // Write manifest record
+        if let Some(manifest) = &self.manifest {
+            manifest.add_record_when_init(crate::manifest::ManifestRecord::Compaction(
+                task.clone(),
+                new_sst_ids.clone(),
+            ))?;
+        }
+
         // Swap the state atomically
         {
             let mut state = self.state.write(); // Lock state for exclusive access
@@ -553,6 +564,17 @@ impl LsmStorageInner {
         let new_ssts = self.compact(&task)?;
         let output_ids: Vec<_> = new_ssts.iter().map(|s| s.sst_id()).collect();
 
+        // Sync directory after writing new SST files
+        self.sync_dir()?;
+
+        // Write manifest record
+        if let Some(manifest) = &self.manifest {
+            manifest.add_record_when_init(crate::manifest::ManifestRecord::Compaction(
+                task.clone(),
+                output_ids.clone(),
+            ))?;
+        }
+
         let mut state_guard = self.state.write();
         let current_state = state_guard.clone();
         let (mut new_state, to_remove) = self.compaction_controller.apply_compaction_result(
@@ -566,6 +588,22 @@ impl LsmStorageInner {
         }
         for &id in &to_remove {
             new_state.sstables.remove(&id);
+        }
+        // Sort levels if leveled or simple compaction
+        if matches!(
+            self.compaction_controller,
+            CompactionController::Leveled(_) | CompactionController::Simple(_)
+        ) {
+            for (_, level_ssts) in &mut new_state.levels {
+                level_ssts.sort_by_key(|&id| {
+                    new_state
+                        .sstables
+                        .get(&id)
+                        .unwrap()
+                        .first_key()
+                        .as_key_slice()
+                });
+            }
         }
         *state_guard = Arc::new(new_state);
         std::mem::drop(state_guard);

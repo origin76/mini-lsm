@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::lsm_storage::LsmStorageState;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TieredCompactionTask {
     pub tiers: Vec<(usize, Vec<usize>)>,
     pub bottom_tier_included: bool,
