@@ -23,7 +23,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 pub use builder::SsTableBuilder;
 use bytes::{Buf, Bytes};
 pub use iterator::SsTableIterator;
@@ -125,7 +125,11 @@ impl FileObject {
     }
 
     pub fn open(path: &Path) -> Result<Self> {
-        let file = File::options().read(true).write(false).open(path)?;
+        let file = File::options()
+            .read(true)
+            .write(false)
+            .open(path)
+            .with_context(|| format!("Failed to open SST file at path: {:?}", path))?;
         let size = file.metadata()?.len();
         Ok(FileObject(Some(file), size))
     }

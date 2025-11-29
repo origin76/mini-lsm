@@ -312,10 +312,13 @@ impl LsmStorageInner {
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
-    pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
+    pub fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
         let manifest_path = path.join("MANIFEST");
+        // 1. 恢复 Manifest
         let (manifest, records) = Manifest::recover(&manifest_path)?;
+
+        // 创建初始状态 (默认包含一个 ID=0 的空 MemTable)
         let mut state = LsmStorageState::create(&options);
 
         let compaction_controller = match &options.compaction_options {
@@ -331,19 +334,32 @@ impl LsmStorageInner {
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
 
+        // 2. 回放 Manifest 记录，重建 MemTable 的结构
         let mut max_sst_id = 0;
         for record in records {
             match record {
                 ManifestRecord::Flush(sst_id) => {
                     max_sst_id = max_sst_id.max(sst_id);
+                    // 只有当 Flush 时，才将 memtable 从内存中移除（变成 L0 SST）
                     if compaction_controller.flush_to_l0() {
                         state.l0_sstables.insert(0, sst_id);
                     } else {
                         state.levels.insert(0, (sst_id, vec![sst_id]));
                     }
+                    // 注意：实际的 memtable 移除逻辑通常配合 NewMemtable 发生，
+                    // 或者在这里如果需要清理 imm_memtables 中对应的 ID。
+                    // 简化的 Mini-LSM 中，Flush 记录通常意味着对应的 ImmMemTable 已经落盘，
+                    // 但 Manifest Replay 主要是为了构建 SST 列表。
+                    // 准确的 ImmMemTable 列表主要依赖 NewMemtable 记录来推导。
                 }
                 ManifestRecord::NewMemtable(id) => {
                     max_sst_id = max_sst_id.max(id);
+                    // [修改点 A] 遇到新 MemTable 记录，说明前一个 MemTable 变成了 Immutable
+                    // 只有当 ID > 0 (即不是初始状态) 时才移动，防止把初始空表放进去
+                    if state.memtable.id() > 0 {
+                        state.imm_memtables.insert(0, state.memtable.clone());
+                    }
+                    // 创建一个新的空 MemTable 占位，稍后用 WAL 填充
                     state.memtable = Arc::new(MemTable::create(id));
                 }
                 ManifestRecord::Compaction(task, output) => {
@@ -357,7 +373,13 @@ impl LsmStorageInner {
             }
         }
 
-        // Load all SSTs
+        println!("Final State to Load:");
+        println!("L0 SSTs: {:?}", state.l0_sstables);
+        for (level_idx, level_ssts) in &state.levels {
+            println!("Level {}: {:?}", level_idx, level_ssts);
+        }
+
+        // 3. 加载 SSTs (保持原样)
         let mut sstables = HashMap::new();
         let all_sst_ids = state
             .l0_sstables
@@ -371,12 +393,51 @@ impl LsmStorageInner {
         }
         state.sstables = sstables;
 
-        let next_id = max_sst_id + 1;
-        let next_sst_id = AtomicUsize::new(next_id);
-        state.memtable = Arc::new(MemTable::create(next_id));
-        next_sst_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let next_sst_id = AtomicUsize::new(max_sst_id + 1);
 
-        // Sort levels if leveled or simple compaction
+        if options.enable_wal {
+            // 我们需要从磁盘读取 WAL 文件，恢复 MemTable 的内容
+
+            // 4.1 恢复 Immutable MemTables
+            let mut new_imm_memtables = Vec::new();
+            for mem in state.imm_memtables {
+                let id = mem.id();
+                let wal_path = path.join(format!("{:05}.wal", id));
+                // 重建 MemTable 对象 (带 WAL)
+                new_imm_memtables.push(Arc::new(MemTable::recover_from_wal(id, wal_path)?));
+            }
+            state.imm_memtables = new_imm_memtables;
+
+            // 4.2 恢复当前的 Mutable MemTable
+            // Manifest Replay 结束时，state.memtable 指向的是最后一次 NewMemtable 的 ID
+            // 如果 Manifest 为空（全新数据库），这里的 ID 可能是 0
+            if state.memtable.id() > 0 {
+                let id = state.memtable.id();
+                let wal_path = path.join(format!("{:05}.wal", id));
+                state.memtable = Arc::new(MemTable::recover_from_wal(id, wal_path)?);
+                // 更新 next_id，基于当前恢复的 MemTable ID
+                next_sst_id.store(id + 1, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                // 如果是全新的库 (ID=0)，我们需要创建一个 ID=1 的新表
+                let next_id = max_sst_id + 1;
+                let wal_path = path.join(format!("{:05}.wal", next_id));
+                state.memtable = Arc::new(MemTable::create_with_wal(next_id, wal_path)?);
+                // 记得记录到 Manifest，否则下次启动不知道有这个表
+                manifest.add_record_when_init(ManifestRecord::NewMemtable(next_id))?;
+                next_sst_id.store(next_id + 1, std::sync::atomic::Ordering::SeqCst);
+            }
+        } else {
+            // == WAL 关闭模式 (原有逻辑) ==
+            // 不从 WAL 恢复，直接创建一个全新的 MemTable
+            // 之前内存里的旧数据因为没有 WAL 都丢失了，所以直接清空
+            state.imm_memtables.clear();
+
+            let next_id = max_sst_id + 1;
+            state.memtable = Arc::new(MemTable::create(next_id));
+            next_sst_id.store(next_id + 1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        // 5. 排序 Levels (保持原样)
         if matches!(
             compaction_controller,
             CompactionController::Leveled(_) | CompactionController::Simple(_)
@@ -405,7 +466,13 @@ impl LsmStorageInner {
     }
 
     pub fn sync(&self) -> Result<()> {
-        unimplemented!()
+        let state = self.state.read();
+
+        if self.options.enable_wal {
+            state.memtable.sync_wal()?;
+        }
+
+        Ok(())
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
@@ -549,19 +616,42 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        let curr_state = self.state.write().clone();
-        let new_state = Arc::new(LsmStorageState {
-            memtable: Arc::new(MemTable::create(self.next_sst_id())),
-            imm_memtables: {
-                let mut imm_memtables = curr_state.imm_memtables.clone();
-                imm_memtables.insert(0, curr_state.memtable.clone());
-                imm_memtables
-            },
-            l0_sstables: curr_state.l0_sstables.clone(),
-            levels: curr_state.levels.clone(),
-            sstables: curr_state.sstables.clone(),
-        });
-        *(self.state.write()) = new_state;
+        // 1. 获取下一个 MemTable/SST 的 ID
+        let memtable_id = self.next_sst_id();
+
+        // 2. 根据是否启用 WAL 创建新的 MemTable
+        let memtable = if self.options.enable_wal {
+            // 构造 WAL 路径，通常是 `<storage_dir>/<id>.wal`
+            // 假设你已经在 lsm_storage.rs 中实现了 path_of_wal 辅助函数
+            let path = self.path_of_wal(memtable_id);
+            Arc::new(MemTable::create_with_wal(memtable_id, path)?)
+        } else {
+            Arc::new(MemTable::create(memtable_id))
+        };
+
+        // 3. 核心修改：如果开启了 WAL，必须在切换内存状态前将 "NewMemtable" 记录写入 Manifest。
+        // 这样如果系统随后立刻崩溃，重启时的 recover 过程才知道去加载这个 memtable_id 对应的 WAL。
+        if self.options.enable_wal
+            && let Some(manifest) = &self.manifest
+        {
+            manifest.add_record(
+                state_lock_observer,
+                ManifestRecord::NewMemtable(memtable_id),
+            )?;
+        }
+
+        // 4. 更新内存状态 (State Update)
+        // 使用 RwLock 的写锁来更新全局状态
+        let mut guard = self.state.write();
+        let mut snapshot = guard.as_ref().clone();
+
+        // 将旧的 memtable 移动到 immutable 列表头部
+        let old_memtable = std::mem::replace(&mut snapshot.memtable, memtable);
+        snapshot.imm_memtables.insert(0, old_memtable);
+
+        // 更新状态指针
+        *guard = Arc::new(snapshot);
+
         Ok(())
     }
 

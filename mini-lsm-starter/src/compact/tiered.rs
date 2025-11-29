@@ -169,53 +169,56 @@ impl TieredCompactionController {
         &self,
         snapshot: &LsmStorageState,
         task: &TieredCompactionTask,
-        output: &[usize], // output 是合并后的新 SST ID 列表
+        output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
-        let levels = snapshot.levels.clone(); // `levels` 的初始副本
+        let levels = snapshot.levels.clone();
         let mut to_remove_sst_ids = Vec::new();
 
-        // 1. 在 `levels` 未被移动前，计算新的层 ID
-        //    这样可以获取到所有当前层 ID 的最大值。
-        let new_tier_id = levels.iter().map(|(id, _)| *id).max().unwrap_or(0) + 1;
-        // NOTE: 如果 level IDs 不是简单地 max+1 并且遵循特定的方案，请调整这里。
-
-        // Collect all old SST IDs that need to be removed from disk
+        // 1. 收集需要物理删除的 SST ID
         for (_, old_sst_ids) in &task.tiers {
             to_remove_sst_ids.extend_from_slice(old_sst_ids);
         }
 
-        // Identify the IDs of tiers to be removed from the `levels` list
-        let tiers_to_remove_from_list: std::collections::HashSet<usize> =
-            task.tiers.iter().map(|(id, _)| *id).collect();
+        // [修复核心]: 不要收集 Tier ID，而是收集 "SST 列表内容"
+        // 因为恢复模式下，Tier ID 可能变了，但内容不会变
+        let tiers_to_remove_content: Vec<&Vec<usize>> = task
+            .tiers
+            .iter()
+            .map(|(_, ssts)| ssts) // 忽略 task 里的 ID，只看 ssts
+            .collect();
 
-        // Remove the tiers that were part of the compaction task
         let mut new_levels_list = Vec::with_capacity(levels.len() - task.tiers.len() + 1);
         let mut insertion_point_found = false;
-        let mut insertion_idx = 0; // Where the new merged tier should be inserted
+        let mut insertion_idx = 0;
 
-        // 这里的 `levels.into_iter()` 消耗了 `levels`
         for (idx, (level_id, sst_ids)) in levels.into_iter().enumerate() {
-            if tiers_to_remove_from_list.contains(&level_id) {
-                // This tier is part of the compaction, do not add it to new_levels_list
+            // [修复核心]: 比较当前层的 sst_ids 是否在任务的目标列表中
+            // 这里使用了 contains 来比较内容 (Vec<usize> 的比较是按值比较的)
+            if tiers_to_remove_content.contains(&&sst_ids) {
+                // 找到了要删除的层（内容匹配上了）
                 if !insertion_point_found {
-                    // The new merged tier should be inserted at the position of the *first* (newest) removed tier.
                     insertion_idx = idx;
                     insertion_point_found = true;
                 }
             } else {
-                // This tier is not part of the compaction, keep it.
+                // 不需要删除，保留
                 new_levels_list.push((level_id, sst_ids));
             }
         }
 
-        // 2. 在 `levels` 被消耗后，才能插入新的层
-        new_levels_list.insert(insertion_idx, (new_tier_id, output.to_vec()));
+        // 3. 插入新生成的层
+        // 只有当有 output 时才插入 (避免空 output 占位)
+        if !output.is_empty() {
+            // 建议：使用 output[0] 作为新 Tier ID，因为它全局唯一且单调递增，
+            let new_tier_id = output[0];
+            new_levels_list.insert(insertion_idx, (new_tier_id, output.to_vec()));
+        }
 
         let new_state = LsmStorageState {
             memtable: snapshot.memtable.clone(),
             imm_memtables: snapshot.imm_memtables.clone(),
             l0_sstables: snapshot.l0_sstables.clone(),
-            levels: new_levels_list, // 使用修正后的 levels 列表
+            levels: new_levels_list,
             sstables: snapshot.sstables.clone(),
         };
 

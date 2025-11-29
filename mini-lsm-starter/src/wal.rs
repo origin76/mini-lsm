@@ -20,7 +20,7 @@ use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -31,16 +31,58 @@ pub struct Wal {
 }
 
 impl Wal {
-    pub fn create(_path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        Ok(Self {
+            file: Arc::new(Mutex::new(BufWriter::new(file))),
+        })
     }
 
-    pub fn recover(_path: impl AsRef<Path>, _skiplist: &SkipMap<Bytes, Bytes>) -> Result<Self> {
-        unimplemented!()
+    pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<Bytes, Bytes>) -> Result<Self> {
+        let path = path.as_ref();
+        let mut file = File::options().read(true).append(true).open(path)?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        let mut ptr = 0;
+        while ptr < buf.len() {
+            if ptr + 4 > buf.len() {
+                break;
+            }
+            let key_len = u32::from_be_bytes(buf[ptr..ptr + 4].try_into().unwrap()) as usize;
+            ptr += 4;
+            if ptr + key_len > buf.len() {
+                break;
+            }
+            let key = Bytes::copy_from_slice(&buf[ptr..ptr + key_len]);
+            ptr += key_len;
+            if ptr + 4 > buf.len() {
+                break;
+            }
+            let val_len = u32::from_be_bytes(buf[ptr..ptr + 4].try_into().unwrap()) as usize;
+            ptr += 4;
+            if ptr + val_len > buf.len() {
+                break;
+            }
+            let value = Bytes::copy_from_slice(&buf[ptr..ptr + val_len]);
+            ptr += val_len;
+            skiplist.insert(key, value);
+        }
+        Ok(Self {
+            file: Arc::new(Mutex::new(BufWriter::new(file))),
+        })
     }
 
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let mut file = self.file.lock();
+        file.write_all(&(key.len() as u32).to_be_bytes())?;
+        file.write_all(key)?;
+        file.write_all(&(value.len() as u32).to_be_bytes())?;
+        file.write_all(value)?;
+        Ok(())
     }
 
     /// Implement this in week 3, day 5; if you want to implement this earlier, use `&[u8]` as the key type.
@@ -49,6 +91,9 @@ impl Wal {
     }
 
     pub fn sync(&self) -> Result<()> {
-        unimplemented!()
+        let mut file = self.file.lock();
+        file.flush()?;
+        file.get_mut().sync_all()?;
+        Ok(())
     }
 }
