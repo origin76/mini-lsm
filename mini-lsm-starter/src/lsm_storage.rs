@@ -58,7 +58,7 @@ use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::key::KeySlice;
+use crate::key::{Key, KeySlice};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, MemTableIterator};
@@ -348,7 +348,6 @@ impl LsmStorageInner {
                 }
                 ManifestRecord::Compaction(task, output) => {
                     for &id in &output {
-                        println!("recover from {}", id);
                         max_sst_id = max_sst_id.max(id);
                     }
                     let (new_state, _) =
@@ -566,118 +565,112 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    /// Force flush the earliest-created immutable memtable to disk
-    pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        // 外层循环用于重试整个过程，直到成功更新状态或者确定无需刷新
-        loop {
-            let memtable_to_flush_id; // 只需要ID来标识，实际的MemTable可能需要重新获取
-            let sst_id;
-            let old_state_arc; // RwLock中当前最新的Arc<LsmStorageState>
+    pub fn verify_lsm_invariants(&self, state: &LsmStorageState) {
+        // 1. 检查 L0: 允许重叠，无需检查 Key 范围
+        // 但可以检查文件是否存在
+        println!("Checking L0: {:?}", state.l0_sstables);
+        for &sst_id in &state.l0_sstables {
+            if !state.sstables.contains_key(&sst_id) {
+                panic!("L0 SST {} missing in sstables map", sst_id);
+            }
+        }
 
-            // 1. 获取当前状态的快照，并决定要刷新的MemTable
-            {
-                let state_read_guard = self.state.read();
-                old_state_arc = state_read_guard.clone(); // 克隆内部的Arc<LsmStorageState>
+        // 2. 检查 L1+: 不允许 Key 重叠，且必须有序
+        for (level_idx, (_, sst_ids)) in state.levels.iter().enumerate() {
+            let mut prev_end_key: Option<&[u8]> = None;
 
-                // 如果 imm_memtables 为空，则没有可刷新的，直接返回
-                if old_state_arc.imm_memtables.is_empty() {
-                    return Ok(());
+            for &sst_id in sst_ids {
+                let sst = state.sstables.get(&sst_id).expect("Level SST missing");
+                let first = sst.first_key().as_key_slice();
+                let last = sst.last_key().as_key_slice();
+
+                // 检查：当前 SST 的开始 Key 必须 > 上一个 SST 的结束 Key
+                if let Some(prev_end) = prev_end_key
+                    && first <= Key::from_slice(prev_end)
+                {
+                    panic!(
+                        "LSM Invariant Violated at Level {}: SST {} [{:?}] overlaps/disordered with previous SST end [{:?}]",
+                        level_idx + 1,
+                        sst_id,
+                        first,
+                        prev_end
+                    );
                 }
 
-                memtable_to_flush_id = old_state_arc
-                    .imm_memtables
-                    .last()
-                    .expect("imm_memtables should not be empty here, checked above.")
-                    .id(); // 只需要ID，MemTable对象本身可能不需要在锁外传递
+                prev_end_key = Some(last.raw_ref());
+            }
+        }
+    }
 
-                // 确保 next_sst_id 是线程安全的（例如，使用 AtomicUsize）
-                sst_id = self.next_sst_id();
-            } // 读锁在这里释放
+    /// Force flush the earliest-created immutable memtable to disk
+    pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
+        // 1. 获取快照并决定要刷新的 MemTable
+        // 在 insert(0) 模式下，Vec 的最后一个元素（last）是最老的
+        let (memtable_to_flush, sst_id) = {
+            let guard = self.state.read();
 
-            // 2. 锁外进行耗时操作 (刷盘)
-            // 从 old_state_arc 中获取 memtable_to_flush_id 对应的 MemTable 实例
-            // 这里需要小心：如果 memtable_to_flush_id 对应的 MemTable 已经被移除，那么这里可能会失败。
-            // 最安全的做法是，在最初获取到 memtable_to_flush 的时候，就克隆其内容，而不是克隆 Arc，
-            // 这样即使其原始 Arc 被替换，你手里的内容依然有效。
-            let memtable_to_flush_instance = old_state_arc
-                .imm_memtables
-                .iter()
-                .find(|m| m.id() == memtable_to_flush_id)
-                .cloned() // 克隆 ImmutableMemtable 的内容
-                .expect("Memtable to flush not found in snapshot, should not happen after check.");
-
-            let mut builder = SsTableBuilder::new(self.options.block_size);
-            memtable_to_flush_instance.flush(&mut builder)?; // 使用克隆的内容进行刷盘
-            let path = self.path_of_sst(sst_id);
-            let sstable = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
-
-            // 3. 进入临界区，获取写锁并尝试更新状态
-            let mut state_write_guard = self.state.write();
-
-            // 关键步骤：在持有写锁时，重新检查并基于最新的状态进行操作
-            let latest_state_arc_in_lock = state_write_guard.clone(); // 获取RwLock中当前最新的Arc<LsmStorageState>
-
-            // a) 检查 imm_memtables 是否仍然为空，或者要刷新的 MemTable 是否依然是最后一个。
-            if latest_state_arc_in_lock.imm_memtables.is_empty() {
-                // 在耗时操作期间，imm_memtables 被清空了。
-                // 本次 flush 任务已经不需要执行，直接成功返回。
+            if guard.imm_memtables.is_empty() {
                 return Ok(());
             }
 
-            // 检查 `memtable_to_flush_id` 是否仍然是 `imm_memtables` 列表中的最后一个。
-            // 如果不是，说明在耗时操作期间，列表被修改了（可能是另一个 flush 完成了，
-            // 或者有新的 imm_memtable 被添加到末尾）。
-            // 这种情况下，本次 flush 尝试是无效的，需要放弃并重试整个循环。
-            if latest_state_arc_in_lock
+            // 获取最后一个元素（最老的）
+            let memtable = guard
                 .imm_memtables
                 .last()
-                .map(|m| m.id())
-                != Some(memtable_to_flush_id)
-            {
-                // 状态已变更，放弃本次更新，回到循环开头重试
-                continue;
-            }
-            // 如果代码执行到这里，说明 memtable_to_flush_id 仍然是 imm_memtables 列表的最后一个元素，
-            // 并且列表不为空。我们可以安全地基于 latest_state_arc_in_lock 进行修改。
+                .expect("imm_memtables should not be empty")
+                .clone();
 
-            // Sync directory after writing SST file
-            self.sync_dir()?;
+            let sst_id = self.next_sst_id();
 
-            // Write manifest record
-            if let Some(manifest) = &self.manifest {
-                manifest.add_record_when_init(crate::manifest::ManifestRecord::Flush(sst_id))?;
-            }
+            (memtable, sst_id)
+        }; // 读锁释放
 
-            // b) 基于最新状态 latest_state_arc_in_lock 构建新的状态
-            let mut imm_memtables = latest_state_arc_in_lock.imm_memtables.clone();
-            imm_memtables.pop(); // 移除最新的 imm_memtable
-            let mut l0_sstables = latest_state_arc_in_lock.l0_sstables.clone();
-            let mut levels = latest_state_arc_in_lock.levels.clone();
-            let mut sstables = latest_state_arc_in_lock.sstables.clone();
-            sstables.insert(sst_id, Arc::new(sstable));
+        // 2. 锁外耗时操作：刷盘
+        let mut builder = SsTableBuilder::new(self.options.block_size);
+        memtable_to_flush.flush(&mut builder)?;
+        let path = self.path_of_sst(sst_id);
+        let sstable = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
 
-            if self.compaction_controller.flush_to_l0() {
-                l0_sstables.insert(0, sst_id);
-            } else {
-                // Tiered compaction: flush to new tier
-                levels.insert(0, (sst_id, vec![sst_id]));
-            }
+        // 3. 获取写锁，更新状态
+        let mut guard = self.state.write();
 
-            let new_state_arc = Arc::new(LsmStorageState {
-                memtable: latest_state_arc_in_lock.memtable.clone(),
-                imm_memtables,
-                l0_sstables,
-                levels,
-                sstables,
-            });
+        let mut latest_state = guard.as_ref().clone();
 
-            // c) 原子替换 RwLock 内部的 Arc<LsmStorageState>
-            *state_write_guard = new_state_arc;
+        // 再次检查：我们刚才刷盘的那个 memtable，是否仍然是 imm_memtables 的最后一个？
+        let current_last_id = latest_state.imm_memtables.last().map(|m| m.id());
 
-            // 成功更新，退出循环
+        if current_last_id != Some(memtable_to_flush.id()) {
+            // 如果 ID 变了，说明已经被其他线程刷走了，直接返回
             return Ok(());
         }
+
+        // 1. 从内存表中移除最老的（尾部）
+        latest_state.imm_memtables.pop();
+
+        // 2. 将新生成的 SST 加入架构
+        latest_state.sstables.insert(sst_id, Arc::new(sstable));
+
+        // 3. 更新 L0 或 Levels
+        if self.compaction_controller.flush_to_l0() {
+            latest_state.l0_sstables.insert(0, sst_id);
+        } else {
+            // Tiered compaction 逻辑
+            latest_state.levels.insert(0, (sst_id, vec![sst_id]));
+        }
+
+        // 4. 更新 Manifest
+        self.sync_dir()?;
+        if let Some(manifest) = &self.manifest {
+            manifest.add_record_when_init(crate::manifest::ManifestRecord::Flush(sst_id))?;
+        }
+
+        // 5. 原子替换状态
+        // 将修改后的结构体包装成新的 Arc，替换掉锁里面的旧 Arc
+        *guard = Arc::new(latest_state);
+
+        Ok(())
     }
+
     pub fn new_txn(&self) -> Result<()> {
         // no-op
         Ok(())

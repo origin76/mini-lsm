@@ -73,7 +73,6 @@ impl BlockMeta {
         while buf.has_remaining() {
             // 读取 offset
             let offset = buf.get_u64_le() as usize; // 读取 8 个字节，作为 u64
-            println!("Decoding BlockMeta at offset: {}", offset);
 
             // 读取 first_key 的长度并读取数据
             let first_key_len = buf.get_u16_le() as usize;

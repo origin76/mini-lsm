@@ -227,14 +227,16 @@ impl LeveledCompactionController {
         if level == 0 {
             // For L0, we need to select SSTs that might overlap
             // Return first few SSTs (based on trigger)
-            snapshot
+            let mut picked: Vec<usize> = snapshot
                 .l0_sstables
                 .iter()
+                .rev()
                 .take(self.options.level0_file_num_compaction_trigger)
                 .cloned()
-                .collect()
+                .collect();
+            picked.reverse();
+            picked
         } else if let Some((_, sst_ids)) = snapshot.levels.get(level - 1) {
-            // For L1+, pick exactly ONE SST - the oldest one (smallest ID)
             if let Some(&oldest_sst_id) = sst_ids.iter().min() {
                 vec![oldest_sst_id]
             } else {

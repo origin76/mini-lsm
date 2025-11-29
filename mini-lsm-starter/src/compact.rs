@@ -576,9 +576,8 @@ impl LsmStorageInner {
         }
 
         let mut state_guard = self.state.write();
-        let current_state = state_guard.clone();
         let (mut new_state, to_remove) = self.compaction_controller.apply_compaction_result(
-            &current_state,
+            &state_guard,
             &task,
             &output_ids,
             false,
@@ -605,6 +604,7 @@ impl LsmStorageInner {
                 });
             }
         }
+        self.verify_lsm_invariants(&new_state);
         *state_guard = Arc::new(new_state);
         std::mem::drop(state_guard);
         let duration = start_time.elapsed(); // 可选：测量耗时
