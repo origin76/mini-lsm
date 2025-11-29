@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use nom::AsBytes;
+use crc32fast;
 
 use super::{BlockMeta, SsTable};
 use crate::{
@@ -66,9 +67,11 @@ impl SsTableBuilder {
         if !res {
             // Instead of calling build() directly, we can handle the builder's state manually:
             let block_data = self.builder.build().encode(); // Finalize the block data
+            let checksum = crc32fast::hash(block_data.as_bytes());
             self.data.extend_from_slice(block_data.as_bytes());
+            self.data.extend_from_slice(&checksum.to_le_bytes());
             self.meta.push(BlockMeta {
-                offset: self.data.len() - block_data.len(),
+                offset: self.data.len() - block_data.len() - 4,
                 first_key: self.builder.first_key(),
                 last_key: Key::from_bytes(bytes::Bytes::from(self.last_key.clone().to_vec())),
             });
@@ -109,9 +112,11 @@ impl SsTableBuilder {
     ) -> Result<SsTable> {
         if !self.builder.is_empty() {
             let block_data = self.builder.build().encode(); // Finalize the block data
+            let checksum = crc32fast::hash(block_data.as_bytes());
             self.data.extend_from_slice(block_data.as_bytes());
+            self.data.extend_from_slice(&checksum.to_le_bytes());
             self.meta.push(BlockMeta {
-                offset: self.data.len() - block_data.len(),
+                offset: self.data.len() - block_data.len() - 4,
                 first_key: self.builder.first_key(),
                 last_key: Key::from_bytes(bytes::Bytes::from(self.last_key.clone().to_vec())),
             });

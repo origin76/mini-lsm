@@ -28,6 +28,7 @@ pub use builder::SsTableBuilder;
 use bytes::{Buf, Bytes};
 pub use iterator::SsTableIterator;
 use nom::AsBytes;
+use crc32fast;
 
 use crate::block::Block;
 use crate::key::{Key, KeyBytes, KeySlice, KeyVec};
@@ -239,7 +240,15 @@ impl SsTable {
         }
         // 根据块元数据中的偏移量读取数据块
         let block_data = self.file.read(meta.offset as u64, len)?;
-        let block = Block::decode(&block_data);
+        let data_len = block_data.len() - 4;
+        let data = &block_data[..data_len];
+        let checksum_bytes: [u8; 4] = block_data[data_len..].try_into().unwrap();
+        let stored_checksum = u32::from_le_bytes(checksum_bytes);
+        let computed_checksum = crc32fast::hash(data);
+        if stored_checksum != computed_checksum {
+            return Err(anyhow::anyhow!("block checksum mismatch"));
+        }
+        let block = Block::decode(data);
         Ok(Arc::new(block))
     }
 
