@@ -574,23 +574,58 @@ impl LsmStorageInner {
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        unimplemented!()
+    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        // 1. 计算 batch 的总大小
+        // 我们需要预先知道这批数据写进去后会不会撑爆 MemTable
+        let mut batch_size = 0;
+        for record in batch {
+            match record {
+                WriteBatchRecord::Put(key, value) => {
+                    batch_size += key.as_ref().len() + value.as_ref().len();
+                }
+                WriteBatchRecord::Del(key) => {
+                    // 删除在 LSM 中通常等于写入一个空的 Value (Tombstone)
+                    // 这里的逻辑参考你提供的 delete 实现：put(key, &[])
+                    batch_size += key.as_ref().len();
+                }
+            }
+        }
+
+        // 2. 检查是否需要冻结 MemTable
+        // 逻辑与原来的 put 一致：当前大小 + 新增大小 >= 阈值
+        if self.state.read().memtable.approximate_size() + batch_size
+            >= self.options.target_sst_size
+        {
+            // 如果需要冻结，获取 state_lock 锁并强制冻结
+            self.force_freeze_memtable(&self.state_lock.lock())?;
+        }
+
+        // 3. 执行写入操作
+        // 获取写锁
+        let guard = self.state.write();
+
+        for record in batch {
+            match record {
+                WriteBatchRecord::Put(key, value) => {
+                    guard.memtable.put(key.as_ref(), value.as_ref())?;
+                }
+                WriteBatchRecord::Del(key) => {
+                    guard.memtable.put(key.as_ref(), &[])?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        if (self.state.read().memtable.approximate_size() + key.len() + value.len())
-            >= self.options.target_sst_size
-        {
-            self.force_freeze_memtable(&self.state_lock.lock())?;
-        }
-        self.state.write().memtable.put(key, value)
+        self.write_batch(&[WriteBatchRecord::Put(key, value)])
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.put(key, &[])
+        self.write_batch(&[WriteBatchRecord::Del(key)])
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
