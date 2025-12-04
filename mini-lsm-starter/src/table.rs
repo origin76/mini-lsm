@@ -26,9 +26,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 pub use builder::SsTableBuilder;
 use bytes::{Buf, Bytes};
+use crc32fast;
 pub use iterator::SsTableIterator;
 use nom::AsBytes;
-use crc32fast;
 
 use crate::block::Block;
 use crate::key::{Key, KeyBytes, KeySlice, KeyVec};
@@ -50,19 +50,17 @@ impl BlockMeta {
     /// Encode block meta to a buffer.
     /// You may add extra fields to the buffer,
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
-    pub fn encode_block_meta(
-        block_meta: &[BlockMeta],
-        #[allow(clippy::ptr_arg)] // remove this allow after you finish
-        buf: &mut Vec<u8>,
-    ) {
+    pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>) {
         for meta in block_meta {
             buf.extend_from_slice(&meta.offset.to_le_bytes());
 
-            buf.extend_from_slice(&(meta.first_key.len() as u16).to_le_bytes());
-            buf.extend_from_slice(meta.first_key.raw_ref());
+            buf.extend_from_slice(&(meta.first_key.key_len() as u16).to_le_bytes());
+            buf.extend_from_slice(meta.first_key.key_ref());
+            buf.extend_from_slice(&meta.first_key.ts().to_le_bytes());
 
-            buf.extend_from_slice(&(meta.last_key.len() as u16).to_le_bytes());
-            buf.extend_from_slice(meta.last_key.raw_ref());
+            buf.extend_from_slice(&(meta.last_key.key_len() as u16).to_le_bytes());
+            buf.extend_from_slice(meta.last_key.key_ref());
+            buf.extend_from_slice(&meta.last_key.ts().to_le_bytes());
         }
     }
 
@@ -77,13 +75,15 @@ impl BlockMeta {
 
             // 读取 first_key 的长度并读取数据
             let first_key_len = buf.get_u16_le() as usize;
-            let first_key = buf.copy_to_bytes(first_key_len).to_vec();
-            let first_key = Key::from_bytes(bytes::Bytes::from(first_key.clone()));
+            let first_key_bytes = buf.copy_to_bytes(first_key_len);
+            let first_ts = buf.get_u64_le();
+            let first_key = Key::from_bytes_with_ts(first_key_bytes, first_ts);
 
             // 读取 last_key 的长度并读取数据
             let last_key_len = buf.get_u16_le() as usize;
-            let last_key = buf.copy_to_bytes(last_key_len).to_vec();
-            let last_key = Key::from_bytes(bytes::Bytes::from(last_key.clone()));
+            let last_key_bytes = buf.copy_to_bytes(last_key_len);
+            let last_ts = buf.get_u64_le();
+            let last_key = Key::from_bytes_with_ts(last_key_bytes, last_ts);
 
             // 创建 BlockMeta
             block_metas.push(BlockMeta {

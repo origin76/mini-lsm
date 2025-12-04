@@ -53,7 +53,22 @@ impl LsmIterator {
             it.next()?;
         }
 
+        // Clamp to the user-specified upper bound if necessary.
+        if !matches!(it.end_bound, Bound::Unbounded) && it.is_valid() {
+            if !it.check_end_bound() {
+                it.is_valid = false;
+            }
+        }
+
         Ok(it)
+    }
+
+    fn check_end_bound(&self) -> bool {
+        match &self.end_bound {
+            Bound::Unbounded => true,
+            Bound::Included(key) => self.key() <= key.as_ref(),
+            Bound::Excluded(key) => self.key() < key.as_ref(),
+        }
     }
 }
 
@@ -73,7 +88,7 @@ impl StorageIterator for LsmIterator {
     }
 
     fn key(&self) -> &[u8] {
-        self.inner.key().raw_ref()
+        self.inner.key().key_ref()
     }
 
     fn value(&self) -> &[u8] {

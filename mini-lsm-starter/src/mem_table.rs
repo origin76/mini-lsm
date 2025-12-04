@@ -156,7 +156,7 @@ impl MemTable {
     pub fn flush(&self, builder: &mut SsTableBuilder) -> Result<()> {
         for entry in self.map.iter() {
             builder.add(
-                KeySlice::from_slice(entry.key().as_ref()),
+                KeySlice::from_slice(entry.key().as_ref(), crate::key::TS_DEFAULT),
                 entry.value().as_ref(),
             );
         }
@@ -210,7 +210,7 @@ impl StorageIterator for MemTableIterator {
     }
 
     fn key(&self) -> KeySlice<'_> {
-        self.with_item(|item| KeySlice::from_slice(item.0.as_ref()))
+        self.with_item(|item| KeySlice::from_slice(item.0.as_ref(), crate::key::TS_DEFAULT))
     }
 
     fn is_valid(&self) -> bool {

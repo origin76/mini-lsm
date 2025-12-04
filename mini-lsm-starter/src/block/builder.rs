@@ -57,20 +57,20 @@ impl BlockBuilder {
         let overlap_len = if self.first_key.is_empty() {
             0
         } else {
-            let a = self.first_key.raw_ref();
-            let b = key.raw_ref();
+            let a = self.first_key.key_ref();
+            let b = key.key_ref();
             let len = a.len().min(b.len());
             (0..len).take_while(|&i| a[i] == b[i]).count() as u16
         };
         let rest_len = if overlap_len == 0 {
-            key.len() as u16
+            key.key_len() as u16
         } else {
-            (key.len() - overlap_len as usize) as u16
+            (key.key_len() - overlap_len as usize) as u16
         };
         let entry_size = overlap_len + rest_len + value.len() as u16 + 6; // overlap u16 + rest_len u16 + rest_key rest_len + value_len u16 + value + 6? Wait no
         // Wait, entry_size is the bytes the data adds: but since rest_key is rest_len bytes, yes rest_len as u16 but in size + rest_len.
 
-        let entry_size = 2 + 2 + rest_len + 2 + value.len() as u16; // overlap_u16 + rest_u16 + rest_key + value_u16 + value
+        let entry_size = 2 + 2 + rest_len + 8 + 2 + value.len() as u16; // overlap_u16 + rest_u16 + rest_key + ts_u64 + value_u16 + value
 
         if offset + entry_size > self.block_size as u16 && !self.first_key.is_empty() {
             return false;
@@ -85,7 +85,8 @@ impl BlockBuilder {
 
         self.data.put_u16_le(overlap_len);
         self.data.put_u16_le(rest_len);
-        self.data.put_slice(&key.raw_ref()[overlap_len as usize..]);
+        self.data.put_slice(&key.key_ref()[overlap_len as usize..]);
+        self.data.put_u64_le(key.ts());
         self.data.put_u16_le(value.len() as u16);
         self.data.put_slice(value);
 

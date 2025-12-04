@@ -113,7 +113,7 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
         self.current
             .as_ref()
             .map(|w| w.1.key())
-            .unwrap_or_else(|| KeySlice::from_slice(&[]))
+            .unwrap_or_else(|| KeySlice::from_slice(&[], crate::key::TS_DEFAULT))
     }
 
     fn value(&self) -> &[u8] {

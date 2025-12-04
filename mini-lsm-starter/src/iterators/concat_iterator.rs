@@ -82,7 +82,7 @@ impl SstConcatIterator {
     }
 
     fn seek_to_key(&mut self, key: KeySlice) -> Result<()> {
-        println!("concat to key {:?}", key.raw_ref());
+        println!("concat to key {:?}", key.key_ref());
 
         // 情况 1: key 小于全局最小 key
         if key < self.sstables[0].first_key().as_key_slice() {

@@ -58,7 +58,7 @@ use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::key::{Key, KeySlice};
+use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, MemTableIterator};
@@ -482,95 +482,107 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let key_slice = KeySlice::from_slice(key);
+        let key_slice = KeySlice::from_slice(key, crate::key::TS_RANGE_BEGIN);
 
-        // Check memtable first
-        match self.state.read().memtable.get(key) {
-            Some(v) => {
-                if v == Bytes::new() {
-                    Ok(None)
-                } else {
-                    Ok(Some(v))
-                }
+        // 1. Memtables (保持不变)
+        let lock = self.state.read();
+        if let Some(v) = lock.memtable.get(key) {
+            if v.is_empty() {
+                return Ok(None);
             }
-            None => {
-                // Check immutable memtables
-                for imm_memtable in &self.state.read().imm_memtables {
-                    if let Some(v) = imm_memtable.get(key) {
-                        if v == Bytes::new() {
-                            return Ok(None);
-                        } else {
-                            return Ok(Some(v));
-                        }
-                    }
+            return Ok(Some(v));
+        }
+
+        // 2. Immutable Memtables (保持不变)
+        for imm_memtable in &lock.imm_memtables {
+            if let Some(v) = imm_memtable.get(key) {
+                if v.is_empty() {
+                    return Ok(None);
                 }
-
-                // Snapshot the state to check SSTables outside the lock
-                let snapshot = self.state.read().clone();
-                let l0_sstables = snapshot.l0_sstables.clone();
-                let levels = snapshot.levels.clone();
-                let sstables = snapshot.sstables.clone();
-                // Lock is now released
-
-                // Check SSTables (latest to oldest)
-                // Check L0 SSTables
-                if self.compaction_controller.flush_to_l0() {
-                    for sst_id in l0_sstables {
-                        if let Some(sst) = sstables.get(&sst_id)
-                            && key_slice >= sst.first_key().as_key_slice()
-                            && key_slice <= sst.last_key().as_key_slice()
-                            && sst
-                                .bloom
-                                .as_ref()
-                                .unwrap()
-                                .may_contain(farmhash::fingerprint32(key))
-                            && let Some((_k, v)) = sst.get(key_slice)?
-                        {
-                            if !v.is_empty() {
-                                return Ok(Some(v));
-                            } else {
-                                return Ok(None); // Tombstone
-                            }
-                        }
-                    }
-                }
-
-                // Check all levels from L1 to max_level
-                for (_level, level_sst_ids) in levels {
-                    if level_sst_ids.is_empty() {
-                        continue;
-                    }
-                    // Binary search to find the SST that may contain the key
-                    let pos = level_sst_ids.partition_point(|&id| {
-                        sstables
-                            .get(&id)
-                            .map(|sst| sst.first_key().as_key_slice() <= key_slice)
-                            .unwrap_or(false)
-                    });
-                    if pos > 0 {
-                        let sst_id = level_sst_ids[pos - 1];
-                        if let Some(sst) = sstables.get(&sst_id)
-                            && key_slice >= sst.first_key().as_key_slice()
-                            && key_slice <= sst.last_key().as_key_slice()
-                            && sst
-                                .bloom
-                                .as_ref()
-                                .unwrap()
-                                .may_contain(farmhash::fingerprint32(key))
-                            && let Some((_k, v)) = sst.get(key_slice)?
-                        {
-                            if !v.is_empty() {
-                                return Ok(Some(v));
-                            } else {
-                                return Ok(None); // Tombstone
-                            }
-                        }
-                    }
-                }
-
-                Ok(None)
+                return Ok(Some(v));
             }
         }
+
+        let l0_sstables = lock.l0_sstables.clone();
+        let levels = lock.levels.clone();
+        let sstables = lock.sstables.clone();
+        drop(lock);
+
+        // 3. Check L0 SSTables
+        if self.compaction_controller.flush_to_l0() {
+            // 修正注：l0_sstables 是 [New, Old]，所以使用 iter() 正向遍历是正确的
+            for sst_id in l0_sstables.iter() {
+                if let Some(sst) = sstables.get(sst_id) {
+                    // 边界检查：只比较 User Key
+                    if key < sst.first_key().key_ref() || key > sst.last_key().key_ref() {
+                        continue;
+                    }
+
+                    // Bloom Filter 检查 (确保 Bloom 也是基于 User Key 构建的)
+                    if let Some(bloom) = &sst.bloom {
+                        if !bloom.may_contain(farmhash::fingerprint32(key)) {
+                            continue;
+                        }
+                    }
+
+                    // 关键修复：不能用 sst.get (精确匹配)，必须用 Iterator Seek (范围匹配)
+                    let mut iter = SsTableIterator::create_and_seek_to_key(sst.clone(), key_slice)?;
+
+                    // 检查 Seek 到的 Key 是否是我们要找的 User Key
+                    if iter.is_valid() && iter.key().key_ref() == key {
+                        let v = iter.value();
+                        if v.is_empty() {
+                            return Ok(None); // Tombstone
+                        }
+                        return Ok(Some(Bytes::copy_from_slice(v)));
+                    }
+                }
+            }
+        }
+
+        // 4. Check Levels (L1 - L_max)
+        for (_level, level_sst_ids) in levels {
+            if level_sst_ids.is_empty() {
+                continue;
+            }
+
+            // 二分查找：找到第一个可能包含 Key 的 SST
+            // partition_point 返回第一个 predicate 为 false 的索引
+            // predicate: sst.first_key <= key
+            // 我们需要的是最后一个 sst.first_key <= key，所以取 pos - 1
+            let pos = level_sst_ids.partition_point(|&id| {
+                let sst = sstables.get(&id).unwrap();
+                sst.first_key().key_ref() <= key
+            });
+
+            if pos > 0 {
+                let sst_id = level_sst_ids[pos - 1];
+                if let Some(sst) = sstables.get(&sst_id) {
+                    // 再次检查范围 (User Key)
+                    if key >= sst.first_key().key_ref() && key <= sst.last_key().key_ref() {
+                        if let Some(bloom) = &sst.bloom {
+                            if !bloom.may_contain(farmhash::fingerprint32(key)) {
+                                continue;
+                            }
+                        }
+
+                        // 关键修复：同样使用 Iterator Seek 代替 sst.get
+                        let iter =
+                            SsTableIterator::create_and_seek_to_key(sst.clone(), key_slice)?;
+
+                        if iter.is_valid() && iter.key().key_ref() == key {
+                            let v = iter.value();
+                            if v.is_empty() {
+                                return Ok(None);
+                            }
+                            return Ok(Some(Bytes::copy_from_slice(v)));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -711,7 +723,7 @@ impl LsmStorageInner {
 
                 // 检查：当前 SST 的开始 Key 必须 > 上一个 SST 的结束 Key
                 if let Some(prev_end) = prev_end_key
-                    && first <= Key::from_slice(prev_end)
+                    && first <= KeySlice::from_slice(prev_end, crate::key::TS_RANGE_BEGIN)
                 {
                     panic!(
                         "LSM Invariant Violated at Level {}: SST {} [{:?}] overlaps/disordered with previous SST end [{:?}]",
@@ -722,7 +734,7 @@ impl LsmStorageInner {
                     );
                 }
 
-                prev_end_key = Some(last.raw_ref());
+                prev_end_key = Some(last.key_ref());
             }
         }
     }
@@ -828,16 +840,18 @@ impl LsmStorageInner {
         // ---- Step 3: SST Iterators ----
         let mut sst_children: Vec<Box<SsTableIterator>> = Vec::new();
         let lower_key_slice = match &lower {
-            Bound::Included(k) | Bound::Excluded(k) => KeySlice::from_slice(k),
-            Bound::Unbounded => KeySlice::from_slice(b""),
+            Bound::Included(k) | Bound::Excluded(k) => {
+                KeySlice::from_slice(k, crate::key::TS_RANGE_BEGIN)
+            }
+            Bound::Unbounded => KeySlice::from_slice(b"", crate::key::TS_RANGE_BEGIN),
         };
 
         // Handle L0 SSTables
         if self.compaction_controller.flush_to_l0() {
             for sst_id in l0_sstables {
                 if let Some(sst) = sstables.get(&sst_id) {
-                    let table_lower = sst.first_key().raw_ref();
-                    let table_upper = sst.last_key().raw_ref();
+                    let table_lower = sst.first_key().key_ref();
+                    let table_upper = sst.last_key().key_ref();
 
                     if table_out_of_range(&lower, &upper, table_lower, table_upper) {
                         continue;
@@ -848,7 +862,7 @@ impl LsmStorageInner {
 
                     if let Bound::Excluded(excl) = &lower
                         && it.is_valid()
-                        && it.key() == KeySlice::from_slice(excl)
+                        && it.key().key_ref() == *excl
                     {
                         it.next()?;
                     }
@@ -885,7 +899,7 @@ impl LsmStorageInner {
                 Bound::Excluded(low) | Bound::Included(low) => {
                     SstConcatIterator::create_and_seek_to_key(
                         ordered_ssts,
-                        KeySlice::from_slice(low),
+                        KeySlice::from_slice(low, crate::key::TS_RANGE_BEGIN),
                     )?
                 }
             };

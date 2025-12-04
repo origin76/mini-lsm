@@ -19,13 +19,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
-use nom::AsBytes;
+use bytes::Bytes;
 use crc32fast;
+use nom::AsBytes;
 
 use super::{BlockMeta, SsTable};
 use crate::{
     block::BlockBuilder,
-    key::{Key, KeySlice},
+    key::{KeyBytes, KeySlice, KeyVec},
     lsm_storage::BlockCache,
     table::{FileObject, bloom::Bloom},
 };
@@ -33,8 +34,8 @@ use crate::{
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
     builder: BlockBuilder,
-    first_key: Vec<u8>,
-    last_key: Vec<u8>,
+    first_key: KeyVec,
+    last_key: KeyVec,
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
@@ -46,8 +47,8 @@ impl SsTableBuilder {
     pub fn new(block_size: usize) -> Self {
         SsTableBuilder {
             builder: BlockBuilder::new(block_size),
-            first_key: Vec::new(),
-            last_key: Vec::new(),
+            first_key: KeyVec::new(),
+            last_key: KeyVec::new(),
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
@@ -62,7 +63,7 @@ impl SsTableBuilder {
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
         // Try adding the key-value pair to the current block.
         let res = self.builder.add(key, value);
-        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
+        self.key_hashes.push(farmhash::fingerprint32(key.key_ref()));
         // If the block is full (i.e., add returns false), finalize it and start a new block.
         if !res {
             // Instead of calling build() directly, we can handle the builder's state manually:
@@ -73,7 +74,7 @@ impl SsTableBuilder {
             self.meta.push(BlockMeta {
                 offset: self.data.len() - block_data.len() - 4,
                 first_key: self.builder.first_key(),
-                last_key: Key::from_bytes(bytes::Bytes::from(self.last_key.clone().to_vec())),
+                last_key: KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(self.last_key.key_ref()), self.last_key.ts()),
             });
 
             // After calling build, reset the builder to avoid moving out of it.
@@ -82,10 +83,10 @@ impl SsTableBuilder {
             assert!(res2);
         }
 
-        if self.first_key.is_empty() {
-            self.first_key = key.to_key_vec().into_inner();
+        if self.first_key.key_len() == 0 {
+            self.first_key.set_from_slice(key);
         }
-        self.last_key = key.to_key_vec().into_inner();
+        self.last_key.set_from_slice(key);
     }
 
     /// Get the estimated size of the SSTable.
@@ -118,7 +119,7 @@ impl SsTableBuilder {
             self.meta.push(BlockMeta {
                 offset: self.data.len() - block_data.len() - 4,
                 first_key: self.builder.first_key(),
-                last_key: Key::from_bytes(bytes::Bytes::from(self.last_key.clone().to_vec())),
+                last_key: KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(self.last_key.key_ref()), self.last_key.ts()),
             });
         }
 
@@ -150,8 +151,8 @@ impl SsTableBuilder {
             block_meta_offset: meta_offset as usize,
             id,
             block_cache,
-            first_key: Key::from_bytes(bytes::Bytes::from(self.first_key.clone().to_vec())),
-            last_key: Key::from_bytes(bytes::Bytes::from(self.last_key.clone().to_vec())),
+            first_key: KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(self.first_key.key_ref()), self.first_key.ts()),
+            last_key: KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(self.last_key.key_ref()), self.last_key.ts()),
             bloom: Some(bloom),
             max_ts: 0,
         })

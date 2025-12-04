@@ -122,20 +122,23 @@ impl BlockIterator {
         let rest_len = u16::from_le_bytes([data[2], data[3]]) as usize;
         let rest_key_start = 4;
         let rest_key = &data[rest_key_start..rest_key_start + rest_len];
+        let ts_start = rest_key_start + rest_len;
+        let ts_bytes: [u8; 8] = data[ts_start..ts_start + 8].try_into().unwrap();
+        let ts = u64::from_le_bytes(ts_bytes);
 
         if idx == 0 {
             // First key
-            self.key = KeyVec::from_vec(rest_key.to_vec());
+            self.key = KeyVec::from_vec_with_ts(rest_key.to_vec(), ts);
             self.first_key = self.key.clone();
         } else {
             // Reconstruct key: first_key[..overlap_len] + rest_key
-            let mut full_key = self.first_key.as_key_slice().raw_ref()[..overlap_len].to_vec();
+            let mut full_key = self.first_key.as_key_slice().key_ref()[..overlap_len].to_vec();
             full_key.extend_from_slice(rest_key);
-            self.key = KeyVec::from_vec(full_key);
+            self.key = KeyVec::from_vec_with_ts(full_key, ts);
         }
 
         // 解析 value
-        let value_offset = rest_key_start + rest_len;
+        let value_offset = ts_start + 8;
         let value_len = u16::from_le_bytes([data[value_offset], data[value_offset + 1]]) as usize;
         let value_start = value_offset + 2;
         let value_end = value_start + value_len;
