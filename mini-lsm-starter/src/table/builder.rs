@@ -74,7 +74,10 @@ impl SsTableBuilder {
             self.meta.push(BlockMeta {
                 offset: self.data.len() - block_data.len() - 4,
                 first_key: self.builder.first_key(),
-                last_key: KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(self.last_key.key_ref()), self.last_key.ts()),
+                last_key: KeyBytes::from_bytes_with_ts(
+                    Bytes::copy_from_slice(self.last_key.key_ref()),
+                    self.last_key.ts(),
+                ),
             });
 
             // After calling build, reset the builder to avoid moving out of it.
@@ -119,7 +122,10 @@ impl SsTableBuilder {
             self.meta.push(BlockMeta {
                 offset: self.data.len() - block_data.len() - 4,
                 first_key: self.builder.first_key(),
-                last_key: KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(self.last_key.key_ref()), self.last_key.ts()),
+                last_key: KeyBytes::from_bytes_with_ts(
+                    Bytes::copy_from_slice(self.last_key.key_ref()),
+                    self.last_key.ts(),
+                ),
             });
         }
 
@@ -151,8 +157,14 @@ impl SsTableBuilder {
             block_meta_offset: meta_offset as usize,
             id,
             block_cache,
-            first_key: KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(self.first_key.key_ref()), self.first_key.ts()),
-            last_key: KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(self.last_key.key_ref()), self.last_key.ts()),
+            first_key: KeyBytes::from_bytes_with_ts(
+                Bytes::copy_from_slice(self.first_key.key_ref()),
+                self.first_key.ts(),
+            ),
+            last_key: KeyBytes::from_bytes_with_ts(
+                Bytes::copy_from_slice(self.last_key.key_ref()),
+                self.last_key.ts(),
+            ),
             bloom: Some(bloom),
             max_ts: 0,
         })

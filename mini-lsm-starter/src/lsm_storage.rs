@@ -58,7 +58,7 @@ use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::key::KeySlice;
+use crate::key::{KeySlice, TS_RANGE_BEGIN, TS_RANGE_END};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, MemTableIterator};
@@ -373,12 +373,6 @@ impl LsmStorageInner {
             }
         }
 
-        println!("Final State to Load:");
-        println!("L0 SSTs: {:?}", state.l0_sstables);
-        for (level_idx, level_ssts) in &state.levels {
-            println!("Level {}: {:?}", level_idx, level_ssts);
-        }
-
         // 3. 加载 SSTs (保持原样)
         let mut sstables = HashMap::new();
         let all_sst_ids = state
@@ -457,7 +451,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: Some(manifest),
             options: options.into(),
-            mvcc: None,
+            mvcc: Some(LsmMvccInner::new(0)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
             is_in_compact: AtomicBool::new(false),
         };
@@ -482,25 +476,32 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let key_slice = KeySlice::from_slice(key, crate::key::TS_RANGE_BEGIN);
+        let key_slice = KeySlice::from_slice(key, TS_RANGE_BEGIN);
 
-        // 1. Memtables (保持不变)
+        // Use merge iterator approach for get
+        // Create a scan from key to key (single key scan)
         let lock = self.state.read();
-        if let Some(v) = lock.memtable.get(key) {
-            if v.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(v));
-        }
 
-        // 2. Immutable Memtables (保持不变)
-        for imm_memtable in &lock.imm_memtables {
-            if let Some(v) = imm_memtable.get(key) {
-                if v.is_empty() {
-                    return Ok(None);
-                }
-                return Ok(Some(v));
+        // 1. Memtables - use scan instead of point lookup
+        let mut mem_children: Vec<Box<MemTableIterator>> = Vec::new();
+        let lower = Bound::Included(KeySlice::from_slice(key, TS_RANGE_BEGIN));
+        let upper = Bound::Included(KeySlice::from_slice(key, TS_RANGE_END));
+
+        mem_children.push(Box::new(lock.memtable.scan(lower, upper)));
+        mem_children.extend(
+            lock.imm_memtables
+                .iter()
+                .map(|m| Box::new(m.scan(lower, upper))),
+        );
+        let memtable_iter = MergeIterator::create(mem_children);
+
+        // Check if found in memtables
+        if memtable_iter.is_valid() && memtable_iter.key().key_ref() == key {
+            let v = memtable_iter.value();
+            if v.is_empty() {
+                return Ok(None); // Tombstone
             }
+            return Ok(Some(Bytes::copy_from_slice(v)));
         }
 
         let l0_sstables = lock.l0_sstables.clone();
@@ -519,14 +520,13 @@ impl LsmStorageInner {
                     }
 
                     // Bloom Filter 检查 (确保 Bloom 也是基于 User Key 构建的)
-                    if let Some(bloom) = &sst.bloom {
-                        if !bloom.may_contain(farmhash::fingerprint32(key)) {
-                            continue;
-                        }
+                    if let Some(bloom) = &sst.bloom
+                        && !bloom.may_contain(farmhash::fingerprint32(key))
+                    {
+                        continue;
                     }
 
-                    // 关键修复：不能用 sst.get (精确匹配)，必须用 Iterator Seek (范围匹配)
-                    let mut iter = SsTableIterator::create_and_seek_to_key(sst.clone(), key_slice)?;
+                    let iter = SsTableIterator::create_and_seek_to_key(sst.clone(), key_slice)?;
 
                     // 检查 Seek 到的 Key 是否是我们要找的 User Key
                     if iter.is_valid() && iter.key().key_ref() == key {
@@ -560,15 +560,19 @@ impl LsmStorageInner {
                 if let Some(sst) = sstables.get(&sst_id) {
                     // 再次检查范围 (User Key)
                     if key >= sst.first_key().key_ref() && key <= sst.last_key().key_ref() {
-                        if let Some(bloom) = &sst.bloom {
-                            if !bloom.may_contain(farmhash::fingerprint32(key)) {
-                                continue;
-                            }
+                        if let Some(bloom) = &sst.bloom
+                            && !bloom.may_contain(farmhash::fingerprint32(key))
+                        {
+                            continue;
                         }
 
+                        println!(
+                            "l1-n first key{:?} last {:?}",
+                            sst.first_key().key_ref(),
+                            sst.last_key().key_ref()
+                        );
                         // 关键修复：同样使用 Iterator Seek 代替 sst.get
-                        let iter =
-                            SsTableIterator::create_and_seek_to_key(sst.clone(), key_slice)?;
+                        let iter = SsTableIterator::create_and_seek_to_key(sst.clone(), key_slice)?;
 
                         if iter.is_valid() && iter.key().key_ref() == key {
                             let v = iter.value();
@@ -587,6 +591,12 @@ impl LsmStorageInner {
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        // Hold write lock to ensure only one thread can write at a time
+        let _write_lock = self.mvcc().write_lock.lock();
+
+        // Get commit timestamp for this batch
+        let ts = self.mvcc().latest_commit_ts() + 1;
+
         // 1. 计算 batch 的总大小
         // 我们需要预先知道这批数据写进去后会不会撑爆 MemTable
         let mut batch_size = 0;
@@ -619,13 +629,20 @@ impl LsmStorageInner {
         for record in batch {
             match record {
                 WriteBatchRecord::Put(key, value) => {
-                    guard.memtable.put(key.as_ref(), value.as_ref())?;
+                    guard
+                        .memtable
+                        .put(KeySlice::from_slice(key.as_ref(), ts), value.as_ref())?;
                 }
                 WriteBatchRecord::Del(key) => {
-                    guard.memtable.put(key.as_ref(), &[])?;
+                    guard
+                        .memtable
+                        .put(KeySlice::from_slice(key.as_ref(), ts), &[])?;
                 }
             }
         }
+
+        // Update commit timestamp
+        self.mvcc().update_commit_ts(ts);
 
         Ok(())
     }
@@ -823,11 +840,25 @@ impl LsmStorageInner {
         let lock = self.state.read();
         let mut mem_children: Vec<Box<MemTableIterator>> = Vec::new();
 
-        mem_children.push(Box::new(lock.memtable.scan(lower, upper)));
+        // Convert bounds to KeySlice with appropriate timestamps
+        // For lower bound: use TS_RANGE_BEGIN to get the largest timestamp first
+        // For upper bound: use TS_RANGE_END to include all timestamps
+        let lower_key = match &lower {
+            Bound::Included(k) => Bound::Included(KeySlice::from_slice(k, TS_RANGE_BEGIN)),
+            Bound::Excluded(k) => Bound::Excluded(KeySlice::from_slice(k, TS_RANGE_END)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let upper_key = match &upper {
+            Bound::Included(k) => Bound::Included(KeySlice::from_slice(k, TS_RANGE_END)),
+            Bound::Excluded(k) => Bound::Excluded(KeySlice::from_slice(k, TS_RANGE_BEGIN)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+
+        mem_children.push(Box::new(lock.memtable.scan(lower_key, upper_key)));
         mem_children.extend(
             lock.imm_memtables
                 .iter()
-                .map(|m| Box::new(m.scan(lower, upper))),
+                .map(|m| Box::new(m.scan(lower_key, upper_key))),
         );
         let memtable_iter = MergeIterator::create(mem_children);
 

@@ -15,7 +15,7 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
@@ -24,7 +24,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::key::KeySlice;
+use crate::key::{KeyBytes, KeySlice};
 
 pub struct Wal {
     file: Arc<Mutex<BufWriter<File>>>,
@@ -42,46 +42,115 @@ impl Wal {
         })
     }
 
-    pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<Bytes, Bytes>) -> Result<Self> {
+    /// WAL format:
+    /// | key_len (exclude ts len) (u16) | key | ts (u64) | value_len (u16) | value | checksum (u32) |
+    pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<KeyBytes, Bytes>) -> Result<Self> {
         let path = path.as_ref();
         let mut file = File::options().read(true).append(true).open(path)?;
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
         let mut ptr = 0;
+
         while ptr < buf.len() {
-            if ptr + 4 > buf.len() {
+            // Read key_len (u16)
+            if ptr + 2 > buf.len() {
                 break;
             }
-            let key_len = u32::from_be_bytes(buf[ptr..ptr + 4].try_into().unwrap()) as usize;
-            ptr += 4;
+            let key_len = u16::from_be_bytes(buf[ptr..ptr + 2].try_into().unwrap()) as usize;
+            ptr += 2;
+
+            // Read key
             if ptr + key_len > buf.len() {
                 break;
             }
-            let key = Bytes::copy_from_slice(&buf[ptr..ptr + key_len]);
+            let key = &buf[ptr..ptr + key_len];
             ptr += key_len;
+
+            // Read ts (u64)
+            if ptr + 8 > buf.len() {
+                break;
+            }
+            let ts = u64::from_be_bytes(buf[ptr..ptr + 8].try_into().unwrap());
+            ptr += 8;
+
+            // Read value_len (u16)
+            if ptr + 2 > buf.len() {
+                break;
+            }
+            let value_len = u16::from_be_bytes(buf[ptr..ptr + 2].try_into().unwrap()) as usize;
+            ptr += 2;
+
+            // Read value
+            if ptr + value_len > buf.len() {
+                break;
+            }
+            let value = &buf[ptr..ptr + value_len];
+            ptr += value_len;
+
+            // Read checksum (u32)
             if ptr + 4 > buf.len() {
                 break;
             }
-            let val_len = u32::from_be_bytes(buf[ptr..ptr + 4].try_into().unwrap()) as usize;
+            let stored_checksum = u32::from_be_bytes(buf[ptr..ptr + 4].try_into().unwrap());
             ptr += 4;
-            if ptr + val_len > buf.len() {
-                break;
+
+            // Compute checksum over key_len, key, ts, value_len, value
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&(key_len as u16).to_be_bytes());
+            hasher.update(key);
+            hasher.update(&ts.to_be_bytes());
+            hasher.update(&(value_len as u16).to_be_bytes());
+            hasher.update(value);
+            let computed_checksum = hasher.finalize();
+
+            if stored_checksum != computed_checksum {
+                bail!(
+                    "WAL checksum mismatch: stored={}, computed={}",
+                    stored_checksum,
+                    computed_checksum
+                );
             }
-            let value = Bytes::copy_from_slice(&buf[ptr..ptr + val_len]);
-            ptr += val_len;
-            skiplist.insert(key, value);
+
+            // Insert into skiplist
+            let key_bytes = KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(key), ts);
+            skiplist.insert(key_bytes, Bytes::copy_from_slice(value));
         }
+
         Ok(Self {
             file: Arc::new(Mutex::new(BufWriter::new(file))),
         })
     }
 
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    /// WAL format:
+    /// | key_len (exclude ts len) (u16) | key | ts (u64) | value_len (u16) | value | checksum (u32) |
+    pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
         let mut file = self.file.lock();
-        file.write_all(&(key.len() as u32).to_be_bytes())?;
-        file.write_all(key)?;
-        file.write_all(&(value.len() as u32).to_be_bytes())?;
+
+        let key_data = key.key_ref();
+        let ts = key.ts();
+
+        // Compute checksum
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&(key_data.len() as u16).to_be_bytes());
+        hasher.update(key_data);
+        hasher.update(&ts.to_be_bytes());
+        hasher.update(&(value.len() as u16).to_be_bytes());
+        hasher.update(value);
+        let checksum = hasher.finalize();
+
+        // Write key_len (u16)
+        file.write_all(&(key_data.len() as u16).to_be_bytes())?;
+        // Write key
+        file.write_all(key_data)?;
+        // Write ts (u64)
+        file.write_all(&ts.to_be_bytes())?;
+        // Write value_len (u16)
+        file.write_all(&(value.len() as u16).to_be_bytes())?;
+        // Write value
         file.write_all(value)?;
+        // Write checksum (u32)
+        file.write_all(&checksum.to_be_bytes())?;
+
         Ok(())
     }
 

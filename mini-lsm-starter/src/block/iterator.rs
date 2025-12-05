@@ -107,7 +107,8 @@ impl BlockIterator {
                 return;
             }
         }
-        println!("not found");
+
+        println!("key : {:?} ; ts :{} not found", key.key_ref(), key.ts());
         self.idx = usize::MAX; // 没找到，invalid
     }
 

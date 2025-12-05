@@ -39,6 +39,7 @@ pub struct LsmIterator {
     inner: LsmIteratorInner,
     end_bound: Bound<Bytes>,
     is_valid: bool,
+    last_returned_key: Option<Vec<u8>>,
 }
 
 impl LsmIterator {
@@ -47,17 +48,31 @@ impl LsmIterator {
             is_valid: iter.is_valid(),
             inner: iter,
             end_bound,
+            last_returned_key: None,
         };
 
-        while it.is_valid && it.inner.value().is_empty() {
-            it.next()?;
+        // 1. 如果迭代器一开始就无效，直接返回
+        if !it.is_valid() {
+            return Ok(it);
         }
 
-        // Clamp to the user-specified upper bound if necessary.
-        if !matches!(it.end_bound, Bound::Unbounded) && it.is_valid() {
-            if !it.check_end_bound() {
-                it.is_valid = false;
-            }
+        // 2. 检查是否超出用户设定的上界
+        if !it.check_end_bound() {
+            it.is_valid = false;
+            return Ok(it);
+        }
+
+        // 3. 初始化 last_returned_key
+        // 这一步是为了让后续的 next() 逻辑能够识别“当前 Key 已经被处理过”，
+        // 从而正确跳过该 Key 的旧版本。
+        let current_key_ref = it.inner.key().key_ref();
+        it.last_returned_key = Some(current_key_ref.to_vec());
+
+        // 4.检查初始位置是否是 Tombstone
+        // 如果当前位置是删除标记（Value 为空），我们需要调用 next() 跳过它及其旧版本，
+        // 直到找到第一个有效的非删除 Key。
+        if it.inner.value().is_empty() {
+            it.next()?;
         }
 
         Ok(it)
@@ -97,22 +112,49 @@ impl StorageIterator for LsmIterator {
 
     fn next(&mut self) -> Result<()> {
         loop {
-            self.inner.next()?; // 推进到底层
+            // 1. 推进到底层迭代器
+            self.inner.next()?;
 
+            // 2. 检查有效性
             if !self.inner.is_valid() {
                 self.is_valid = false;
                 return Ok(());
             }
 
-            // 检查是否超出 end_bound
-            if !self.is_valid() {
+            // 3. 检查边界
+            if !self.check_end_bound() {
                 self.is_valid = false;
                 return Ok(());
             }
 
-            if !self.inner.value().is_empty() {
+            // 4. 获取当前 User Key
+            let current_key_ref = self.inner.key().key_ref();
+
+            // 5. 判断是否是新 Key
+            let is_new_key = self
+                .last_returned_key
+                .as_ref()
+                .is_none_or(|last| last != current_key_ref);
+
+            // 6. 核心逻辑分支
+            if is_new_key {
+                // [关键步骤 A] 无论是否为 Tombstone，必须先记录这个 Key。
+                // 这样下一次循环时，才能正确识别并跳过这个 Key 的旧版本。
+                self.last_returned_key = Some(current_key_ref.to_vec());
+
+                // [关键步骤 B] 检查 Value 是否为空 (Tombstone)
+                if self.inner.value().is_empty() {
+                    // 如果是删除标记，绝对不能 return！
+                    // 直接 continue，进入下一次 loop。
+                    // 下一次 loop 会读到旧版本，但因为 is_new_key 为 false，会被跳过。
+                    continue;
+                }
+
+                // 只有非空的有效值，才返回给用户
                 return Ok(());
             }
+
+            // 如果不是新 Key (旧版本)，隐式 continue，继续找下一个。
         }
     }
 }
