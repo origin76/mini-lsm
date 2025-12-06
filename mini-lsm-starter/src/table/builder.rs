@@ -40,6 +40,7 @@ pub struct SsTableBuilder {
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
     key_hashes: Vec<u32>,
+    max_ts: u64,
 }
 
 impl SsTableBuilder {
@@ -53,6 +54,7 @@ impl SsTableBuilder {
             meta: Vec::new(),
             block_size,
             key_hashes: Vec::new(),
+            max_ts: 0,
         }
     }
 
@@ -61,6 +63,9 @@ impl SsTableBuilder {
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
+        // Track the maximum timestamp
+        self.max_ts = self.max_ts.max(key.ts());
+
         // Try adding the key-value pair to the current block.
         let res = self.builder.add(key, value);
         self.key_hashes.push(farmhash::fingerprint32(key.key_ref()));
@@ -137,6 +142,9 @@ impl SsTableBuilder {
         BlockMeta::encode_block_meta(&self.meta, &mut encoded_mata);
         sstable_data.extend_from_slice(&encoded_mata);
 
+        // Store max_ts after block metadata
+        sstable_data.extend_from_slice(&self.max_ts.to_le_bytes());
+
         // 拼接 Meta Block Offset（元数据块偏移量）
         let meta_offset = self.data.len() as u32;
         sstable_data.extend_from_slice(&meta_offset.to_le_bytes());
@@ -166,7 +174,7 @@ impl SsTableBuilder {
                 self.last_key.ts(),
             ),
             bloom: Some(bloom),
-            max_ts: 0,
+            max_ts: self.max_ts,
         })
     }
 

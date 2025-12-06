@@ -38,42 +38,33 @@ type LsmIteratorInner = TwoMergeIterator<
 pub struct LsmIterator {
     inner: LsmIteratorInner,
     end_bound: Bound<Bytes>,
+    read_ts: u64,
     is_valid: bool,
     last_returned_key: Option<Vec<u8>>,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
+    pub(crate) fn new(
+        iter: LsmIteratorInner,
+        end_bound: Bound<Bytes>,
+        read_ts: u64,
+    ) -> Result<Self> {
         let mut it = Self {
             is_valid: iter.is_valid(),
             inner: iter,
             end_bound,
-            last_returned_key: None,
+            read_ts,
+            last_returned_key: None, // 初始必须为 None
         };
 
-        // 1. 如果迭代器一开始就无效，直接返回
+        // 1. 初始空校验
         if !it.is_valid() {
             return Ok(it);
         }
 
-        // 2. 检查是否超出用户设定的上界
-        if !it.check_end_bound() {
-            it.is_valid = false;
-            return Ok(it);
-        }
-
-        // 3. 初始化 last_returned_key
-        // 这一步是为了让后续的 next() 逻辑能够识别“当前 Key 已经被处理过”，
-        // 从而正确跳过该 Key 的旧版本。
-        let current_key_ref = it.inner.key().key_ref();
-        it.last_returned_key = Some(current_key_ref.to_vec());
-
-        // 4.检查初始位置是否是 Tombstone
-        // 如果当前位置是删除标记（Value 为空），我们需要调用 next() 跳过它及其旧版本，
-        // 直到找到第一个有效的非删除 Key。
-        if it.inner.value().is_empty() {
-            it.next()?;
-        }
+        // 2. 初始移动逻辑 (核心修复)
+        // 我们需要找到第一个“可见”且“非 Tombstone”的 Key
+        it.move_to_first_valid()?;
 
         Ok(it)
     }
@@ -83,6 +74,43 @@ impl LsmIterator {
             Bound::Unbounded => true,
             Bound::Included(key) => self.key() <= key.as_ref(),
             Bound::Excluded(key) => self.key() < key.as_ref(),
+        }
+    }
+
+    fn move_to_first_valid(&mut self) -> Result<()> {
+        loop {
+            // 1. 基础有效性检查
+            if !self.inner.is_valid() {
+                self.is_valid = false;
+                return Ok(());
+            }
+            if !self.check_end_bound() {
+                self.is_valid = false;
+                return Ok(());
+            }
+
+            // 2. 检查时间戳：如果当前版本太新，直接跳过，不要更新 last_returned_key
+            if self.inner.key().ts() > self.read_ts {
+                self.inner.next()?;
+                continue;
+            }
+
+            // 3. 此时 ts <= read_ts，说明我们找到了该 Key 在快照下的最新版本
+            // 此时才记录 Key，为了屏蔽后续更旧的版本
+            self.last_returned_key = Some(self.inner.key().key_ref().to_vec());
+
+            // 4. 检查是否为 Tombstone
+            if self.inner.value().is_empty() {
+                // 如果是删除标记，说明该 Key 被删除了。
+                // 我们调用 self.next()。注意：这里调用 next() 是安全的，
+                // 因为 last_returned_key 已经设置了，next() 会自动跳过该 Key 的剩余旧版本，
+                // 直接去找下一个不同的 Key。
+                self.next()?;
+                continue;
+            }
+
+            // 找到有效数据，退出循环
+            return Ok(());
         }
     }
 }
@@ -131,30 +159,38 @@ impl StorageIterator for LsmIterator {
             let current_key_ref = self.inner.key().key_ref();
 
             // 5. 判断是否是新 Key
-            let is_new_key = self
-                .last_returned_key
-                .as_ref()
-                .is_none_or(|last| last != current_key_ref);
-
-            // 6. 核心逻辑分支
-            if is_new_key {
-                // [关键步骤 A] 无论是否为 Tombstone，必须先记录这个 Key。
-                // 这样下一次循环时，才能正确识别并跳过这个 Key 的旧版本。
-                self.last_returned_key = Some(current_key_ref.to_vec());
-
-                // [关键步骤 B] 检查 Value 是否为空 (Tombstone)
-                if self.inner.value().is_empty() {
-                    // 如果是删除标记，绝对不能 return！
-                    // 直接 continue，进入下一次 loop。
-                    // 下一次 loop 会读到旧版本，但因为 is_new_key 为 false，会被跳过。
-                    continue;
-                }
-
-                // 只有非空的有效值，才返回给用户
-                return Ok(());
+            // 如果 last_returned_key 和当前 key 一样，说明这是同一个 key 的更老版本
+            // 我们直接跳过（因为我们已经处理过该 key 的最新可见版本了）
+            if let Some(last) = &self.last_returned_key
+                && last == current_key_ref
+            {
+                continue;
             }
 
-            // 如果不是新 Key (旧版本)，隐式 continue，继续找下一个。
+            // 走到这里，说明遇到了一个全新的 Key（或者之前遇到的版本都因为太新被跳过了）
+
+            // [关键步骤 A] 检查时间戳是否在读取范围
+            // 如果当前版本太新，我们不能算作“看见”了这个 Key。
+            // 我们不更新 last_returned_key，直接 continue。
+            // 这样下一次循环遇到该 Key 的旧版本时，上面的 if 判断依然不成立，
+            // 从而有机会进入这里的逻辑。
+            if self.inner.key().ts() > self.read_ts {
+                continue;
+            }
+
+            // [关键步骤 B] 既然时间戳符合要求，这个 Key 版本就是当前快照下的最新版本。
+            // 现在记录这个 Key，屏蔽掉后续更老的版本。
+            self.last_returned_key = Some(current_key_ref.to_vec());
+
+            // [关键步骤 C] 检查 Value 是否为空 (Tombstone)
+            // 虽然是 Tombstone，但我们已经在步骤 B 记录了 Key，
+            // 所以后续的老版本依然会被最上面的 if 过滤掉。这是正确的。
+            if self.inner.value().is_empty() {
+                continue;
+            }
+
+            // 只有非空的有效值，且时间戳在范围内，才返回给用户
+            return Ok(());
         }
     }
 }

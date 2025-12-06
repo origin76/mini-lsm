@@ -170,7 +170,13 @@ impl SsTable {
         let meta_offset_offset = bloom_offset - 4;
         let meta_offset_bytes = file.read(meta_offset_offset, 4)?;
         let block_meta_offset = u32::from_le_bytes(meta_offset_bytes.try_into().unwrap()) as u64;
-        let block_meta_len = bloom_offset - 4 - block_meta_offset;
+
+        // Read max_ts (stored right after block metadata, before meta_offset)
+        let max_ts_offset = meta_offset_offset - 8;
+        let max_ts_bytes = file.read(max_ts_offset, 8)?;
+        let max_ts = u64::from_le_bytes(max_ts_bytes.try_into().unwrap());
+
+        let block_meta_len = max_ts_offset - block_meta_offset;
 
         let block_meta = SsTable::read_block_meta(&file, block_meta_offset, block_meta_len)?;
 
@@ -191,8 +197,8 @@ impl SsTable {
             block_cache,
             first_key,
             last_key,
-            bloom: Some(bloom), // Bloom filter can be handled later
-            max_ts: 0,          // You can compute this during the iteration phase
+            bloom: Some(bloom),
+            max_ts,
         })
     }
 

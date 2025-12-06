@@ -15,7 +15,7 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use anyhow::{Ok, Result, anyhow};
 use bytes::Bytes;
+use crossbeam_skiplist::SkipMap;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::block::Block;
@@ -63,6 +64,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, MemTableIterator};
 use crate::mvcc::LsmMvccInner;
+use crate::mvcc::txn::{Transaction, TxnIterator};
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
@@ -247,7 +249,7 @@ impl MiniLsm {
         }))
     }
 
-    pub fn new_txn(&self) -> Result<()> {
+    pub fn new_txn(&self) -> Result<Arc<Transaction>> {
         self.inner.new_txn()
     }
 
@@ -275,11 +277,7 @@ impl MiniLsm {
         self.inner.sync()
     }
 
-    pub fn scan(
-        &self,
-        lower: Bound<&[u8]>,
-        upper: Bound<&[u8]>,
-    ) -> Result<FusedIterator<LsmIterator>> {
+    pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
         self.inner.scan(lower, upper)
     }
 
@@ -375,6 +373,7 @@ impl LsmStorageInner {
 
         // 3. 加载 SSTs (保持原样)
         let mut sstables = HashMap::new();
+        let mut max_ts_from_ssts: u64 = 0;
         let all_sst_ids = state
             .l0_sstables
             .iter()
@@ -383,11 +382,16 @@ impl LsmStorageInner {
             let sst_path = Self::path_of_sst_static(path, id);
             let file = crate::table::FileObject::open(&sst_path)?;
             let sst = SsTable::open(id, Some(Arc::new(BlockCache::new(1024))), file)?;
+            // Track the maximum timestamp from SSTs
+            max_ts_from_ssts = max_ts_from_ssts.max(sst.max_ts());
             sstables.insert(id, Arc::new(sst));
         }
         state.sstables = sstables;
 
         let next_sst_id = AtomicUsize::new(max_sst_id + 1);
+
+        // Track the maximum timestamp from memtables (when WAL is enabled)
+        let mut max_ts_from_memtables: u64 = 0;
 
         if options.enable_wal {
             // 我们需要从磁盘读取 WAL 文件，恢复 MemTable 的内容
@@ -398,7 +402,11 @@ impl LsmStorageInner {
                 let id = mem.id();
                 let wal_path = path.join(format!("{:05}.wal", id));
                 // 重建 MemTable 对象 (带 WAL)
-                new_imm_memtables.push(Arc::new(MemTable::recover_from_wal(id, wal_path)?));
+                let recovered = Arc::new(MemTable::recover_from_wal(id, wal_path)?);
+                // Find max timestamp from recovered memtable
+                max_ts_from_memtables =
+                    max_ts_from_memtables.max(Self::get_max_ts_from_memtable(&recovered));
+                new_imm_memtables.push(recovered);
             }
             state.imm_memtables = new_imm_memtables;
 
@@ -409,6 +417,9 @@ impl LsmStorageInner {
                 let id = state.memtable.id();
                 let wal_path = path.join(format!("{:05}.wal", id));
                 state.memtable = Arc::new(MemTable::recover_from_wal(id, wal_path)?);
+                // Find max timestamp from recovered memtable
+                max_ts_from_memtables =
+                    max_ts_from_memtables.max(Self::get_max_ts_from_memtable(&state.memtable));
                 // 更新 next_id，基于当前恢复的 MemTable ID
                 next_sst_id.store(id + 1, std::sync::atomic::Ordering::SeqCst);
             } else {
@@ -431,6 +442,9 @@ impl LsmStorageInner {
             next_sst_id.store(next_id + 1, std::sync::atomic::Ordering::SeqCst);
         }
 
+        // Compute the latest committed timestamp
+        let initial_ts = max_ts_from_ssts.max(max_ts_from_memtables);
+
         // 5. 排序 Levels (保持原样)
         if matches!(
             compaction_controller,
@@ -451,7 +465,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: Some(manifest),
             options: options.into(),
-            mvcc: Some(LsmMvccInner::new(0)),
+            mvcc: Some(LsmMvccInner::new(initial_ts)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
             is_in_compact: AtomicBool::new(false),
         };
@@ -825,24 +839,17 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    pub fn new_txn(&self) -> Result<()> {
-        // no-op
-        Ok(())
-    }
-
-    /// Create an iterator over a range of keys.
-    pub fn scan(
+    pub(crate) fn scan_with_ts(
         &self,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
+        read_ts: u64,
     ) -> Result<FusedIterator<LsmIterator>> {
         // ---- Step 1: Memtables ----
         let lock = self.state.read();
         let mut mem_children: Vec<Box<MemTableIterator>> = Vec::new();
 
-        // Convert bounds to KeySlice with appropriate timestamps
-        // For lower bound: use TS_RANGE_BEGIN to get the largest timestamp first
-        // For upper bound: use TS_RANGE_END to include all timestamps
+        // Convert bounds to KeySlice with read_ts limits
         let lower_key = match &lower {
             Bound::Included(k) => Bound::Included(KeySlice::from_slice(k, TS_RANGE_BEGIN)),
             Bound::Excluded(k) => Bound::Excluded(KeySlice::from_slice(k, TS_RANGE_END)),
@@ -888,15 +895,7 @@ impl LsmStorageInner {
                         continue;
                     }
 
-                    let mut it =
-                        SsTableIterator::create_and_seek_to_key(sst.clone(), lower_key_slice)?;
-
-                    if let Bound::Excluded(excl) = &lower
-                        && it.is_valid()
-                        && it.key().key_ref() == *excl
-                    {
-                        it.next()?;
-                    }
+                    let it = SsTableIterator::create_and_seek_to_key(sst.clone(), lower_key_slice)?;
 
                     if it.is_valid() {
                         sst_children.push(Box::new(it));
@@ -948,7 +947,201 @@ impl LsmStorageInner {
         let mem_l0 = TwoMergeIterator::create(memtable_iter, sst_iter)?;
         let final_iter = TwoMergeIterator::create(mem_l0, level_merge)?;
 
-        let iter = LsmIterator::new(final_iter, upper.map(Bytes::copy_from_slice))?;
+        let mut iter = LsmIterator::new(final_iter, upper.map(Bytes::copy_from_slice), read_ts)?;
+
+        if let Bound::Excluded(lower_key) = lower {
+            // 这是一个循环，防止 LsmIterator 内部因为版本问题没跳干净（虽然 LsmIterator 应该已经处理了版本）
+            // 但为了安全，只要 Key 相同就一直 next
+            while iter.is_valid() && iter.key() == lower_key {
+                iter.next()?;
+            }
+        }
         Ok(FusedIterator::new(iter))
+    }
+
+    pub(crate) fn get_with_ts(&self, key: &[u8], read_ts: u64) -> Result<Option<Bytes>> {
+        let key_slice = KeySlice::from_slice(key, crate::key::TS_RANGE_BEGIN);
+
+        // Use merge iterator approach for get
+        // Create a scan from key to key (single key scan)
+        let lock = self.state.read();
+
+        // 1. Memtables - use scan instead of point lookup
+        let mut mem_children: Vec<Box<MemTableIterator>> = Vec::new();
+        let lower = Bound::Included(KeySlice::from_slice(key, TS_RANGE_BEGIN));
+        let upper = Bound::Included(KeySlice::from_slice(key, TS_RANGE_END));
+
+        mem_children.push(Box::new(lock.memtable.scan(lower, upper)));
+        mem_children.extend(
+            lock.imm_memtables
+                .iter()
+                .map(|m| Box::new(m.scan(lower, upper))),
+        );
+        let mut memtable_iter = MergeIterator::create(mem_children);
+
+        while memtable_iter.is_valid()
+            && memtable_iter.key().key_ref() == key
+            && memtable_iter.key().ts() > read_ts
+        {
+            memtable_iter.next()?;
+        }
+
+        // 检查此时停下来的位置是否有效
+        if memtable_iter.is_valid() && memtable_iter.key().key_ref() == key
+        // 此时隐含 ts <= read_ts，因为上面的 while 循环退出了
+        {
+            let v = memtable_iter.value();
+            if v.is_empty() {
+                return Ok(None); // Tombstone
+            }
+            return Ok(Some(Bytes::copy_from_slice(v)));
+        }
+
+        let l0_sstables = lock.l0_sstables.clone();
+        let levels = lock.levels.clone();
+        let sstables = lock.sstables.clone();
+        drop(lock);
+
+        // 3. Check L0 SSTables
+        if self.compaction_controller.flush_to_l0() {
+            // 修正注：l0_sstables 是 [New, Old]，所以使用 iter() 正向遍历是正确的
+            for sst_id in l0_sstables.iter() {
+                if let Some(sst) = sstables.get(sst_id) {
+                    // 边界检查：只比较 User Key
+                    if key < sst.first_key().key_ref() || key > sst.last_key().key_ref() {
+                        continue;
+                    }
+
+                    // Bloom Filter 检查 (确保 Bloom 也是基于 User Key 构建的)
+                    if let Some(bloom) = &sst.bloom
+                        && !bloom.may_contain(farmhash::fingerprint32(key))
+                    {
+                        continue;
+                    }
+
+                    let mut iter = SsTableIterator::create_and_seek_to_key(sst.clone(), key_slice)?;
+
+                    // 检查 Seek 到的 Key 是否是我们要找的 User Key，且 ts <= read_ts
+                    while iter.is_valid()
+                        && iter.key().key_ref() == key
+                        && iter.key().ts() > read_ts
+                    {
+                        iter.next()?;
+                    }
+
+                    if iter.is_valid() && iter.key().key_ref() == key {
+                        // 此时 ts <= read_ts
+                        let v = iter.value();
+                        if v.is_empty() {
+                            return Ok(None);
+                        }
+                        return Ok(Some(Bytes::copy_from_slice(v)));
+                    }
+                }
+            }
+        }
+
+        // 4. Check Levels (L1 - L_max)
+        for (_level, level_sst_ids) in levels {
+            if level_sst_ids.is_empty() {
+                continue;
+            }
+
+            // 二分查找：找到第一个可能包含 Key 的 SST
+            // partition_point 返回第一个 predicate 为 false 的索引
+            // predicate: sst.first_key <= key
+            // 我们需要的是最后一个 sst.first_key <= key，所以取 pos - 1
+            let pos = level_sst_ids.partition_point(|&id| {
+                let sst = sstables.get(&id).unwrap();
+                sst.first_key().key_ref() <= key
+            });
+
+            if pos > 0 {
+                let sst_id = level_sst_ids[pos - 1];
+                if let Some(sst) = sstables.get(&sst_id) {
+                    // 再次检查范围 (User Key)
+                    if key >= sst.first_key().key_ref() && key <= sst.last_key().key_ref() {
+                        if let Some(bloom) = &sst.bloom
+                            && !bloom.may_contain(farmhash::fingerprint32(key))
+                        {
+                            continue;
+                        }
+
+                        // 关键修复：同样使用 Iterator Seek 代替 sst.get
+                        let mut iter =
+                            SsTableIterator::create_and_seek_to_key(sst.clone(), key_slice)?;
+
+                        while iter.is_valid()
+                            && iter.key().key_ref() == key
+                            && iter.key().ts() > read_ts
+                        {
+                            iter.next()?;
+                        }
+
+                        if iter.is_valid() && iter.key().key_ref() == key {
+                            let v = iter.value();
+                            if v.is_empty() {
+                                return Ok(None);
+                            }
+                            return Ok(Some(Bytes::copy_from_slice(v)));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn new_txn(self: &Arc<Self>) -> Result<Arc<Transaction>> {
+        let mut ts_guard = self.mvcc().ts.lock();
+
+        // 2. 获取读取时间戳 (Read Timestamp)
+        // 这是当前系统最新的提交时间，事务只能看到小于等于这个时间的数据
+        let read_ts = ts_guard.0;
+
+        // 3. 更新水位线 (Watermark)
+        // 告诉系统：有一个事务正在读取 read_ts 的快照，请不要回收旧数据
+        ts_guard.1.add_reader(read_ts);
+
+        // 释放锁
+        drop(ts_guard);
+
+        // 4. 初始化 key_hashes (用于串行化检查)
+        // 如果 options 开启了 serializable，我们需要初始化 HashSet 来记录读写集
+        let key_hashes = if self.options.serializable {
+            Some(Mutex::new((HashSet::new(), HashSet::new())))
+        } else {
+            None
+        };
+
+        // 5. 构造 Transaction 实例
+        Ok(Arc::new(Transaction {
+            read_ts,
+            inner: self.clone(),
+            local_storage: Arc::new(SkipMap::new()), // 初始化空的本地写入缓冲区
+            committed: Arc::new(AtomicBool::new(false)), // 初始状态未提交
+            key_hashes,
+        }))
+    }
+
+    /// Create an iterator over a range of keys.
+    pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
+        let txn = self.mvcc().new_txn(self.clone(), false);
+        txn.scan(lower, upper)
+    }
+
+    /// Helper function to get the maximum timestamp from a memtable
+    fn get_max_ts_from_memtable(memtable: &MemTable) -> u64 {
+        let mut max_ts: u64 = 0;
+        let iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
+        let mut iter = iter;
+        while iter.is_valid() {
+            max_ts = max_ts.max(iter.key().ts());
+            if iter.next().is_err() {
+                break;
+            }
+        }
+        max_ts
     }
 }
