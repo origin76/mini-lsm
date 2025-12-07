@@ -197,7 +197,7 @@ impl LsmStorageInner {
 
                 let merge_iter = CompactionIterator::Merge(MergeIterator::create(iterators));
 
-                self.compact_generate_sst_from_iter(merge_iter)
+                self.compact_generate_sst_from_iter(merge_iter, task.compact_to_bottom_level())
             }
             CompactionTask::Simple(task) => {
                 let snapshot = self.state.read().clone();
@@ -262,7 +262,10 @@ impl LsmStorageInner {
                         )))
                     };
 
-                self.compact_generate_sst_from_iter(*final_compaction_iterator)
+                self.compact_generate_sst_from_iter(
+                    *final_compaction_iterator,
+                    task.is_lower_level_bottom_level,
+                )
             }
             CompactionTask::Tiered(task) => {
                 let snapshot = self.state.read().clone();
@@ -290,7 +293,7 @@ impl LsmStorageInner {
                 let final_iter = CompactionIterator::Merge(MergeIterator::create(iterators));
 
                 // 现在可以直接传入辅助函数了
-                self.compact_generate_sst_from_iter(final_iter)
+                self.compact_generate_sst_from_iter(final_iter, task.bottom_tier_included)
             }
             CompactionTask::Leveled(task) => {
                 let snapshot = self.state.read().clone();
@@ -349,7 +352,10 @@ impl LsmStorageInner {
                         )))
                     };
 
-                self.compact_generate_sst_from_iter(*final_compaction_iterator)
+                self.compact_generate_sst_from_iter(
+                    *final_compaction_iterator,
+                    task.is_lower_level_bottom_level,
+                )
             }
         }
     }
@@ -357,30 +363,67 @@ impl LsmStorageInner {
     // 核心 MVCC 压缩逻辑
     fn compact_generate_sst_from_iter(
         &self,
-        mut iter: CompactionIterator, // <--- 直接写死类型，不再有多态烦恼
+        mut iter: CompactionIterator,
+        compact_to_bottom_level: bool,
     ) -> Result<Vec<Arc<SsTable>>> {
         let mut builder = SsTableBuilder::new(self.options.block_size);
         let mut new_ssts = Vec::new();
-        let mut last_user_key = Vec::new();
+        let mut last_user_key: Vec<u8> = Vec::new();
+        // Track the last key added to the current builder (for SST splitting)
+        let mut last_key_in_builder: Vec<u8> = Vec::new();
+
+        // Get watermark for MVCC version cleanup
+        let watermark = self.mvcc().watermark();
+        // Track if we've seen a version at or below watermark for the current key
+        let mut has_version_at_or_below_watermark = false;
 
         while iter.is_valid() {
-            let key = iter.key(); // CompactionIterator 肯定返回 KeySlice
+            let key = iter.key();
             let value = iter.value();
+            let ts = key.ts();
+            let current_user_key = key.key_ref();
 
-            if builder.estimated_size() >= self.options.target_sst_size
-                && key.key_ref() != last_user_key
-            {
-                let sst_id = self.next_sst_id();
-                let path = self.path_of_sst(sst_id);
-                let sst = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
-                new_ssts.push(Arc::new(sst));
-                builder = SsTableBuilder::new(self.options.block_size);
+            // Check if this is a new user key
+            if current_user_key != last_user_key {
+                // Reset tracking for new key
+                has_version_at_or_below_watermark = false;
+                last_user_key = current_user_key.to_vec();
             }
 
-            builder.add(key, value);
+            // Determine if we should keep this version
+            let should_keep = if ts > watermark {
+                // Version above watermark: always keep
+                true
+            } else {
+                // Version at or below watermark
+                if has_version_at_or_below_watermark {
+                    // Already seen a version at or below watermark for this key, skip
+                    false
+                } else {
+                    // First (latest) version at or below watermark
+                    has_version_at_or_below_watermark = true;
+                    // If it's a delete marker and we're at bottom level, we can remove it
+                    !(compact_to_bottom_level && value.is_empty())
+                }
+            };
 
-            if key.key_ref() != last_user_key {
-                last_user_key = key.key_ref().to_vec();
+            if should_keep {
+                // Check if we need to split to a new SST
+                // Only split when we have a different user key from the last key in the builder
+                if builder.estimated_size() >= self.options.target_sst_size
+                    && !last_key_in_builder.is_empty()
+                    && current_user_key != last_key_in_builder.as_slice()
+                {
+                    let sst_id = self.next_sst_id();
+                    let path = self.path_of_sst(sst_id);
+                    let sst = builder.build(sst_id, Some(self.block_cache.clone()), path)?;
+                    new_ssts.push(Arc::new(sst));
+                    builder = SsTableBuilder::new(self.options.block_size);
+                    last_key_in_builder.clear();
+                }
+
+                builder.add(key, value);
+                last_key_in_builder = current_user_key.to_vec();
             }
 
             iter.next()?;
