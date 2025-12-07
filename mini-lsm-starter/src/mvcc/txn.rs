@@ -97,7 +97,11 @@ impl Transaction {
 }
 
 impl Drop for Transaction {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        let mut ts_guard = self.inner.mvcc.as_ref().unwrap().ts.lock();
+
+        ts_guard.1.remove_reader(self.read_ts);
+    }
 }
 
 type SkipMapRangeIter<'a> =
