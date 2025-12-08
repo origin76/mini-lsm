@@ -35,7 +35,7 @@ use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::key::KeySlice;
-use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::lsm_storage::{CompactionFilter, LsmStorageInner, LsmStorageState};
 use crate::table::{SsTable, SsTableBuilder, iterator::SsTableIterator};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,8 +402,19 @@ impl LsmStorageInner {
                 } else {
                     // First (latest) version at or below watermark
                     has_version_at_or_below_watermark = true;
-                    // If it's a delete marker and we're at bottom level, we can remove it
-                    !(compact_to_bottom_level && value.is_empty())
+                    // Check compaction filters
+                    let compaction_filters = self.compaction_filters.lock();
+                    let matches_filter = compaction_filters.iter().any(|filter| match filter {
+                        CompactionFilter::Prefix(prefix) => {
+                            current_user_key.starts_with(&prefix[..])
+                        }
+                    });
+                    if matches_filter {
+                        false
+                    } else {
+                        // If it's a delete marker and we're at bottom level, we can remove it
+                        !(compact_to_bottom_level && value.is_empty())
+                    }
                 }
             };
 
