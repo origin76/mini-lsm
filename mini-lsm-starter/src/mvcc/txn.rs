@@ -18,7 +18,7 @@
 use std::{
     collections::HashSet,
     ops::Bound,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{Arc, atomic::AtomicBool, atomic::Ordering},
 };
 
 use anyhow::Result;
@@ -30,7 +30,7 @@ use parking_lot::Mutex;
 use crate::{
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
-    lsm_storage::LsmStorageInner,
+    lsm_storage::{LsmStorageInner, WriteBatchRecord},
 };
 
 pub struct Transaction {
@@ -44,7 +44,18 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        if self.committed.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("Transaction already committed"));
+        }
         println!("read ts {}", self.read_ts);
+        // First probe local storage
+        if let Some(entry) = self.local_storage.get(key) {
+            let value = entry.value().clone();
+            // If value is empty, it's a deletion marker - return None
+            // Otherwise, return the value
+            return Ok(if value.is_empty() { None } else { Some(value) });
+        }
+        // Not found in local storage, check LSM
         self.inner.get_with_ts(key, self.read_ts)
     }
 
@@ -58,6 +69,9 @@ impl Transaction {
 
     // 在 Transaction impl 中
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
+        if self.committed.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("Transaction already committed"));
+        }
         // 1. 创建 LSM 迭代器
         let lsm_iter = self.inner.scan_with_ts(lower, upper, self.read_ts)?;
 
@@ -66,7 +80,7 @@ impl Transaction {
         let local_upper = Self::map_bound(upper);
 
         // 3. 创建本地迭代器
-        let local_iter = TxnLocalIterator::try_new(
+        let mut local_iter = TxnLocalIterator::try_new(
             self.local_storage.clone(),
             move |map: &Arc<SkipMap<Bytes, Bytes>>| {
                 // 注意 move
@@ -78,21 +92,48 @@ impl Transaction {
             (Bytes::new(), Bytes::new()),
         )?;
 
+        local_iter.next()?;
+
         // 4. 合并
         let merge_iter = TwoMergeIterator::create(local_iter, lsm_iter)?;
         TxnIterator::create(self.clone(), merge_iter)
     }
 
-    pub fn put(&self, key: &[u8], value: &[u8]) {
-        unimplemented!()
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        if self.committed.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("Transaction already committed"));
+        }
+        self.local_storage
+            .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
+        Ok(())
     }
 
-    pub fn delete(&self, key: &[u8]) {
-        unimplemented!()
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        if self.committed.load(Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("Transaction already committed"));
+        }
+        self.local_storage
+            .insert(Bytes::copy_from_slice(key), Bytes::new());
+        Ok(())
     }
 
     pub fn commit(&self) -> Result<()> {
-        unimplemented!()
+        let batch: Vec<WriteBatchRecord<Bytes>> = self
+            .local_storage
+            .iter()
+            .map(|entry| {
+                let key = entry.key();
+                let value = entry.value();
+                if value.is_empty() {
+                    WriteBatchRecord::Del(key.clone())
+                } else {
+                    WriteBatchRecord::Put(key.clone(), value.clone())
+                }
+            })
+            .collect();
+        self.inner.write_batch(&batch)?;
+        self.committed.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -123,18 +164,41 @@ impl StorageIterator for TxnLocalIterator {
     type KeyType<'a> = &'a [u8];
 
     fn value(&self) -> &[u8] {
-        self.with_item(|item| &item.1)
+        self.with_item(|item| item.1.as_ref())
     }
 
     fn key(&self) -> &[u8] {
-        self.with_item(|item| &item.0)
+        self.with_item(|item| item.0.as_ref())
     }
 
     fn is_valid(&self) -> bool {
-        false // Always invalid for now since empty
+        !self.with_item(|item| item.0.is_empty())
     }
 
     fn next(&mut self) -> Result<()> {
+        let mut next_item: Option<(Bytes, Bytes)> = None;
+
+        self.with_iter_mut(|iter| {
+            if let Some(entry) = iter.next() {
+                next_item = Some((entry.key().clone(), entry.value().clone()));
+            } else {
+                next_item = None;
+            }
+        });
+
+        match next_item {
+            Some((k, v)) => {
+                self.with_item_mut(|item| {
+                    *item = (k, v);
+                });
+            }
+            None => {
+                self.with_item_mut(|item| {
+                    *item = (Bytes::new(), Bytes::new());
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -147,9 +211,19 @@ pub struct TxnIterator {
 impl TxnIterator {
     pub fn create(
         txn: Arc<Transaction>,
-        iter: TwoMergeIterator<TxnLocalIterator, FusedIterator<LsmIterator>>,
+        mut iter: TwoMergeIterator<TxnLocalIterator, FusedIterator<LsmIterator>>,
     ) -> Result<Self> {
-        Ok(Self { _txn: txn, iter })
+        // Initialize by moving to first valid position
+        loop {
+            if !iter.is_valid() {
+                return Ok(Self { _txn: txn, iter });
+            }
+            if iter.value().is_empty() {
+                iter.next()?;
+                continue;
+            }
+            return Ok(Self { _txn: txn, iter });
+        }
     }
 }
 
@@ -168,11 +242,21 @@ impl StorageIterator for TxnIterator {
     }
 
     fn is_valid(&self) -> bool {
-        self.iter.is_valid()
+        self.iter.is_valid() && !self.iter.value().is_empty()
     }
 
     fn next(&mut self) -> Result<()> {
-        self.iter.next()
+        loop {
+            self.iter.next()?;
+            if !self.iter.is_valid() {
+                return Ok(());
+            }
+            // Skip deletion markers (empty values)
+            if self.iter.value().is_empty() {
+                continue;
+            }
+            return Ok(());
+        }
     }
 
     fn num_active_iterators(&self) -> usize {
