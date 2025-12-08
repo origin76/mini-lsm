@@ -230,6 +230,8 @@ impl Transaction {
 
             // 可选：清理太久远的历史记录以节省内存（Watermark 机制）
             // 这一步通常在 Compaction 或独立线程做，但在这里顺手做也是可以的
+            let watermark = mvcc.watermark();
+            committed_txns.retain(|&ts, _| ts >= watermark);
         }
 
         // 6. 标记事务完成
