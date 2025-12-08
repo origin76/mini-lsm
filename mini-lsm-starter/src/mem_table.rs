@@ -145,27 +145,28 @@ impl MemTable {
     }
 
     /// Put a key-value pair into the mem-table.
-    ///
-    /// In week 1, day 1, simply put the key-value pair into the skipmap.
-    /// In week 2, day 6, also flush the data to WAL.
-    /// In week 3, day 5, modify the function to use the batch API.
+    /// Now uses the batch API.
     pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
-        if let Some(ref wal) = self.wal {
-            wal.put(key, value)?;
-        }
-        self.approximate_size.fetch_add(
-            key.key_len() + value.len(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        let key_bytes =
-            KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(key.key_ref()), key.ts());
-        self.map.insert(key_bytes, Bytes::copy_from_slice(value));
-        Ok(())
+        self.put_batch(&[(key, value)])
     }
 
     /// Implement this in week 3, day 5; if you want to implement this earlier, use `&[u8]` as the key type.
-    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
-        unimplemented!()
+    pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        if let Some(ref wal) = self.wal {
+            wal.put_batch(data)?;
+        }
+        for (key, value) in data {
+            self.approximate_size.fetch_add(
+                key.key_len() + value.len(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        for (key, value) in data {
+            let key_bytes =
+                KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(key.key_ref()), key.ts());
+            self.map.insert(key_bytes, Bytes::copy_from_slice(value));
+        }
+        Ok(())
     }
 
     pub fn sync_wal(&self) -> Result<()> {

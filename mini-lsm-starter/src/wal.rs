@@ -16,7 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use anyhow::{Result, bail};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
 use std::fs::File;
@@ -43,7 +43,9 @@ impl Wal {
     }
 
     /// WAL format:
-    /// | key_len (exclude ts len) (u16) | key | ts (u64) | value_len (u16) | value | checksum (u32) |
+    /// New batch: | batch_size (u32) | BODY | checksum (u32) |
+    /// BODY: repeated (key_len u16 | key | ts u64 | value_len u16 | value)
+    /// Old single: | key_len (u16) | key | ts (u64) | value_len (u16) | value | checksum (u32) |
     pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<KeyBytes, Bytes>) -> Result<Self> {
         let path = path.as_ref();
         let mut file = File::options().read(true).append(true).open(path)?;
@@ -52,6 +54,65 @@ impl Wal {
         let mut ptr = 0;
 
         while ptr < buf.len() {
+            // Try batch format first
+            if ptr + 4 <= buf.len() {
+                let batch_size = u32::from_be_bytes(buf[ptr..ptr + 4].try_into().unwrap()) as usize;
+                let body_start = ptr + 4;
+                let body_end = body_start + batch_size;
+                let checksum_start = body_end;
+                if checksum_start + 4 <= buf.len() {
+                    let footer_checksum = u32::from_be_bytes(
+                        buf[checksum_start..checksum_start + 4].try_into().unwrap(),
+                    );
+                    // Compute checksum over body
+                    let mut hasher = crc32fast::Hasher::new();
+                    hasher.update(&buf[body_start..body_end]);
+                    let computed_checksum = hasher.finalize();
+                    if computed_checksum == footer_checksum {
+                        // Parse batch
+                        let mut ptr2 = body_start;
+                        while ptr2 < body_end {
+                            if ptr2 + 2 > body_end {
+                                bail!("Batch corrupted: not enough bytes for key_len");
+                            }
+                            let key_len =
+                                u16::from_be_bytes(buf[ptr2..ptr2 + 2].try_into().unwrap())
+                                    as usize;
+                            ptr2 += 2;
+                            if ptr2 + key_len > body_end {
+                                bail!("Batch corrupted: not enough bytes for key");
+                            }
+                            let key = &buf[ptr2..ptr2 + key_len];
+                            ptr2 += key_len;
+                            if ptr2 + 8 > body_end {
+                                bail!("Batch corrupted: not enough bytes for ts");
+                            }
+                            let ts = u64::from_be_bytes(buf[ptr2..ptr2 + 8].try_into().unwrap());
+                            ptr2 += 8;
+                            if ptr2 + 2 > body_end {
+                                bail!("Batch corrupted: not enough bytes for value_len");
+                            }
+                            let value_len =
+                                u16::from_be_bytes(buf[ptr2..ptr2 + 2].try_into().unwrap())
+                                    as usize;
+                            ptr2 += 2;
+                            if ptr2 + value_len > body_end {
+                                bail!("Batch corrupted: not enough bytes for value");
+                            }
+                            let value = &buf[ptr2..ptr2 + value_len];
+                            ptr2 += value_len;
+                            // Insert
+                            let key_bytes =
+                                KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(key), ts);
+                            skiplist.insert(key_bytes, Bytes::copy_from_slice(value));
+                        }
+                        ptr = checksum_start + 4;
+                        continue; // parsed as batch
+                    }
+                }
+            }
+
+            // Fallback to old single format
             // Read key_len (u16)
             if ptr + 2 > buf.len() {
                 break;
@@ -121,42 +182,48 @@ impl Wal {
         })
     }
 
-    /// WAL format:
-    /// | key_len (exclude ts len) (u16) | key | ts (u64) | value_len (u16) | value | checksum (u32) |
     pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
-        let mut file = self.file.lock();
-
-        let key_data = key.key_ref();
-        let ts = key.ts();
-
-        // Compute checksum
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&(key_data.len() as u16).to_be_bytes());
-        hasher.update(key_data);
-        hasher.update(&ts.to_be_bytes());
-        hasher.update(&(value.len() as u16).to_be_bytes());
-        hasher.update(value);
-        let checksum = hasher.finalize();
-
-        // Write key_len (u16)
-        file.write_all(&(key_data.len() as u16).to_be_bytes())?;
-        // Write key
-        file.write_all(key_data)?;
-        // Write ts (u64)
-        file.write_all(&ts.to_be_bytes())?;
-        // Write value_len (u16)
-        file.write_all(&(value.len() as u16).to_be_bytes())?;
-        // Write value
-        file.write_all(value)?;
-        // Write checksum (u32)
-        file.write_all(&checksum.to_be_bytes())?;
-
-        Ok(())
+        self.put_batch(&[(key, value)])
     }
 
     /// Implement this in week 3, day 5; if you want to implement this earlier, use `&[u8]` as the key type.
-    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
-        unimplemented!()
+    pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        let mut file = self.file.lock();
+
+        // Compute body first to get batch_size
+        use bytes::BufMut;
+        let mut body = Vec::new();
+        for (key_slice, value) in data {
+            let key_data = key_slice.key_ref();
+            let ts = key_slice.ts();
+
+            // key_len u16
+            body.put_u16(key_data.len() as u16);
+            // key
+            body.extend_from_slice(key_data);
+            // ts u64
+            body.put_u64(ts);
+            // value_len u16
+            body.put_u16(value.len() as u16);
+            // value
+            body.extend_from_slice(value);
+        }
+
+        let batch_size = body.len() as u32;
+
+        // Compute checksum over body
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&body);
+        let checksum = hasher.finalize();
+
+        // Write header: batch_size u32
+        file.write_all(&batch_size.to_be_bytes())?;
+        // Write body
+        file.write_all(&body)?;
+        // Write footer: checksum u32
+        file.write_all(&checksum.to_be_bytes())?;
+
+        Ok(())
     }
 
     pub fn sync(&self) -> Result<()> {
