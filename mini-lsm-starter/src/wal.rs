@@ -16,7 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use anyhow::{Result, bail};
-use bytes::{BufMut, Bytes};
+use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use parking_lot::Mutex;
 use std::fs::File;

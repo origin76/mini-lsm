@@ -24,6 +24,7 @@ use std::{
 use anyhow::Result;
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
+use farmhash;
 use ouroboros::self_referencing;
 use parking_lot::Mutex;
 
@@ -31,6 +32,7 @@ use crate::{
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
     lsm_storage::{LsmStorageInner, WriteBatchRecord},
+    mvcc::CommittedTxnData,
 };
 
 pub struct Transaction {
@@ -47,16 +49,29 @@ impl Transaction {
         if self.committed.load(Ordering::SeqCst) {
             return Err(anyhow::anyhow!("Transaction already committed"));
         }
+        let key_hash = if self.key_hashes.is_some() {
+            farmhash::hash32(key)
+        } else {
+            0
+        };
         println!("read ts {}", self.read_ts);
         // First probe local storage
         if let Some(entry) = self.local_storage.get(key) {
             let value = entry.value().clone();
             // If value is empty, it's a deletion marker - return None
             // Otherwise, return the value
-            return Ok(if value.is_empty() { None } else { Some(value) });
+            let result = Ok(if value.is_empty() { None } else { Some(value) });
+            if self.key_hashes.is_some() {
+                self.key_hashes.as_ref().unwrap().lock().0.insert(key_hash);
+            }
+            return result;
         }
         // Not found in local storage, check LSM
-        self.inner.get_with_ts(key, self.read_ts)
+        let result = self.inner.get_with_ts(key, self.read_ts);
+        if self.key_hashes.is_some() {
+            self.key_hashes.as_ref().unwrap().lock().0.insert(key_hash);
+        }
+        result
     }
 
     fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
@@ -103,6 +118,10 @@ impl Transaction {
         if self.committed.load(Ordering::SeqCst) {
             return Err(anyhow::anyhow!("Transaction already committed"));
         }
+        if self.key_hashes.is_some() {
+            let key_hash = farmhash::hash32(key);
+            self.key_hashes.as_ref().unwrap().lock().1.insert(key_hash);
+        }
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
         Ok(())
@@ -112,12 +131,73 @@ impl Transaction {
         if self.committed.load(Ordering::SeqCst) {
             return Err(anyhow::anyhow!("Transaction already committed"));
         }
+        if self.key_hashes.is_some() {
+            let key_hash = farmhash::hash32(key);
+            self.key_hashes.as_ref().unwrap().lock().1.insert(key_hash);
+        }
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::new());
         Ok(())
     }
 
     pub fn commit(&self) -> Result<()> {
+        // 0. 防止重复提交
+        if self.committed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // 检查本地是否有写入数据
+        // 如果本地完全没有数据修改，甚至不需要获取 commit_lock，直接返回即可
+        // (这一步是性能优化，非必须，但推荐)
+        if self.local_storage.is_empty() {
+            self.committed.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
+
+        // 1. 获取 MVCC 全局提交锁
+        let mvcc = self.inner.mvcc.as_ref().unwrap();
+        let _commit_guard = mvcc.commit_lock.lock();
+
+        // 2. 验证阶段 (只针对 Serializable 模式)
+        // 我们需要一个变量来决定是否需要在提交后更新 committed_txns
+        let serializable_write_set = if let Some(guard) = &self.key_hashes {
+            let guard = guard.lock();
+            let (read_set, write_set) = (&guard.0, &guard.1);
+
+            // 2.1 只读事务优化：如果开启了串行化但没有写操作，直接成功
+            if write_set.is_empty() {
+                self.committed.store(true, Ordering::SeqCst);
+                return Ok(());
+            }
+
+            // 2.2 冲突检测
+            // 只有 serializable 模式才需要去查 committed_txns
+            let committed_txns = mvcc.committed_txns.lock();
+
+            // 遍历 (read_ts, +inf) 范围内的所有已提交事务
+            for (_, txn_data) in
+                committed_txns.range((Bound::Excluded(self.read_ts), Bound::Unbounded))
+            {
+                // 检查：我的读集 ∩ 别人的写集
+                for hash in read_set {
+                    if txn_data.key_hashes.contains(hash) {
+                        return Err(anyhow::anyhow!("Validation failed: serializable conflict"));
+                    }
+                }
+            }
+
+            // 验证通过，返回 write_set 以便稍后更新历史记录
+            Some(write_set.clone())
+        } else {
+            // 【关键修改】
+            // 如果没有开启 serializable (key_hashes 为 None)
+            // 我们不做验证，也不需要返回 write_set 给 committed_txns
+            // 但我们 绝对不能 在这里 return Ok(())，必须让它继续往下走去执行写入！
+            None
+        };
+
+        // 3. 写入阶段：构造 WriteBatch
+        // 无论是否 serializable，只要代码走到这里，说明都允许写入
         let batch: Vec<WriteBatchRecord<Bytes>> = self
             .local_storage
             .iter()
@@ -131,8 +211,30 @@ impl Transaction {
                 }
             })
             .collect();
-        self.inner.write_batch(&batch)?;
+
+        // 4. 执行写入并获取提交时间戳 (Commit TS)
+        // 这一步会分配 commit_ts 并更新 MVCC 水位
+        let commit_ts = self.inner.write_batch_inner(&batch)?;
+
+        // 5. 记录阶段：更新已提交事务历史 (仅 Serializable 模式需要)
+        if let Some(write_set) = serializable_write_set {
+            let mut committed_txns = mvcc.committed_txns.lock();
+            committed_txns.insert(
+                commit_ts,
+                CommittedTxnData {
+                    key_hashes: write_set,
+                    read_ts: self.read_ts,
+                    commit_ts,
+                },
+            );
+
+            // 可选：清理太久远的历史记录以节省内存（Watermark 机制）
+            // 这一步通常在 Compaction 或独立线程做，但在这里顺手做也是可以的
+        }
+
+        // 6. 标记事务完成
         self.committed.store(true, Ordering::SeqCst);
+
         Ok(())
     }
 }
@@ -204,25 +306,48 @@ impl StorageIterator for TxnLocalIterator {
 }
 
 pub struct TxnIterator {
-    _txn: Arc<Transaction>,
+    txn: Arc<Transaction>,
     iter: TwoMergeIterator<TxnLocalIterator, FusedIterator<LsmIterator>>,
 }
 
 impl TxnIterator {
     pub fn create(
         txn: Arc<Transaction>,
-        mut iter: TwoMergeIterator<TxnLocalIterator, FusedIterator<LsmIterator>>,
+        iter: TwoMergeIterator<TxnLocalIterator, FusedIterator<LsmIterator>>,
     ) -> Result<Self> {
         // Initialize by moving to first valid position
-        loop {
-            if !iter.is_valid() {
-                return Ok(Self { _txn: txn, iter });
+        let mut txn_iter = Self { txn, iter };
+
+        // 跳过删除标记
+        txn_iter.skip_deletes()?;
+
+        // 如果初始位置有效，记录到读取集
+        txn_iter.add_to_read_set_if_valid();
+
+        Ok(txn_iter)
+    }
+
+    fn skip_deletes(&mut self) -> Result<()> {
+        // 只要当前有效，且 Value 为空（Tombstone），就继续往后找
+        while self.iter.is_valid() && self.iter.value().is_empty() {
+            self.iter.next()?;
+        }
+        Ok(())
+    }
+
+    fn add_to_read_set_if_valid(&self) {
+        // 1. 检查是否开启了串行化 (Serializability)
+        // key_hashes 只有在 serializable 模式下才是 Some
+        if let Some(guard) = &self.txn.key_hashes {
+            if self.iter.is_valid() {
+                // 2. 计算哈希
+                let key = self.iter.key();
+                let hash = farmhash::fingerprint32(key);
+
+                // 3. 上锁并记录
+                let mut guard = guard.lock();
+                guard.0.insert(hash); // guard.0 是 read_set
             }
-            if iter.value().is_empty() {
-                iter.next()?;
-                continue;
-            }
-            return Ok(Self { _txn: txn, iter });
         }
     }
 }
@@ -246,17 +371,12 @@ impl StorageIterator for TxnIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        loop {
-            self.iter.next()?;
-            if !self.iter.is_valid() {
-                return Ok(());
-            }
-            // Skip deletion markers (empty values)
-            if self.iter.value().is_empty() {
-                continue;
-            }
-            return Ok(());
-        }
+        self.iter.next()?;
+        self.skip_deletes()?;
+
+        self.add_to_read_set_if_valid();
+
+        Ok(())
     }
 
     fn num_active_iterators(&self) -> usize {

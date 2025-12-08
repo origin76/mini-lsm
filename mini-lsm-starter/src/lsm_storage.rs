@@ -603,16 +603,53 @@ impl LsmStorageInner {
         Ok(None)
     }
 
-    /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        // Hold write lock to ensure only one thread can write at a time
+    pub fn write_batch<T: AsRef<[u8]>>(
+        self: &Arc<Self>,
+        batch: &[WriteBatchRecord<T>],
+    ) -> Result<()> {
+        // 检查配置：是否开启了串行化快照隔离
+        if self.options.serializable {
+            // 路径 A: 开启串行化 -> 隐式事务
+            // 创建一个新事务
+            let txn = self.new_txn()?;
+
+            // 将 batch 中的操作应用到事务的 local_storage 中
+            for record in batch {
+                match record {
+                    WriteBatchRecord::Put(key, value) => {
+                        let _ = txn.put(key.as_ref(), value.as_ref());
+                    }
+                    WriteBatchRecord::Del(key) => {
+                        let _ = txn.delete(key.as_ref());
+                    }
+                }
+            }
+
+            // 提交事务
+            // txn.commit() 内部会进行冲突检测，并通过 verify 后调用 write_batch_inner
+            txn.commit()?;
+
+            Ok(())
+        } else {
+            // 路径 B: 未开启串行化 -> 直接写入
+            // 直接调用核心逻辑，忽略返回的时间戳
+            self.write_batch_inner(batch)?;
+            Ok(())
+        }
+    }
+
+    /// 核心写入逻辑：直接写入 MemTable 并更新 MVCC
+    /// 返回值：本次写入分配的 commit_ts
+    pub fn write_batch_inner<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<u64> {
+        // 1. 获取 MVCC 写锁
+        // 这确保了同一时间只有一个线程（或事务提交）能写入 MemTable，
+        // 从而保证 commit_ts 是严格递增且不冲突的。
         let _write_lock = self.mvcc().write_lock.lock();
 
-        // Get commit timestamp for this batch
+        // 2. 分配时间戳
         let ts = self.mvcc().latest_commit_ts() + 1;
 
-        // 1. 计算 batch 的总大小
-        // 我们需要预先知道这批数据写进去后会不会撑爆 MemTable
+        // 3. 计算 batch 大小 (原有逻辑)
         let mut batch_size = 0;
         for record in batch {
             match record {
@@ -620,26 +657,21 @@ impl LsmStorageInner {
                     batch_size += key.as_ref().len() + value.as_ref().len();
                 }
                 WriteBatchRecord::Del(key) => {
-                    // 删除在 LSM 中通常等于写入一个空的 Value (Tombstone)
-                    // 这里的逻辑参考你提供的 delete 实现：put(key, &[])
                     batch_size += key.as_ref().len();
                 }
             }
         }
 
-        // 2. 检查是否需要冻结 MemTable
-        // 逻辑与原来的 put 一致：当前大小 + 新增大小 >= 阈值
+        // 4. 检查是否需要冻结 MemTable (原有逻辑)
         if self.state.read().memtable.approximate_size() + batch_size
             >= self.options.target_sst_size
         {
-            // 如果需要冻结，获取 state_lock 锁并强制冻结
-            self.force_freeze_memtable(&self.state_lock.lock())?;
+            let state_lock = self.state_lock.lock();
+            self.force_freeze_memtable(&state_lock)?;
         }
 
-        // 3. 执行写入操作
-        // 获取写锁
+        // 5. 执行写入 (原有逻辑)
         let guard = self.state.write();
-
         for record in batch {
             match record {
                 WriteBatchRecord::Put(key, value) => {
@@ -655,19 +687,20 @@ impl LsmStorageInner {
             }
         }
 
-        // Update commit timestamp
+        // 6. 更新最新提交时间戳
         self.mvcc().update_commit_ts(ts);
 
-        Ok(())
+        // 7. 【关键修改】返回时间戳
+        Ok(ts)
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn put(self: &Arc<Self>, key: &[u8], value: &[u8]) -> Result<()> {
         self.write_batch(&[WriteBatchRecord::Put(key, value)])
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, key: &[u8]) -> Result<()> {
+    pub fn delete(self: &Arc<Self>, key: &[u8]) -> Result<()> {
         self.write_batch(&[WriteBatchRecord::Del(key)])
     }
 
